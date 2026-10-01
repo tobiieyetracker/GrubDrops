@@ -4,6 +4,29 @@ All notable changes to GrubDrops.
 
 ## [Unreleased]
 
+### Added
+
+- **Dynamic priority preemption in `ordered` mode.** While watching, the
+  watcher now re-scans eligible campaigns every ~2 minutes. If a
+  strictly higher-ranked whitelisted game has an eligible campaign with a
+  live drops-enabled channel, the current watch is stopped cleanly and the
+  watcher returns to the pick flow — without waiting for the current drop
+  to complete. Server-side progress is untouched and no claim is
+  triggered. Same/lower-rank campaigns never preempt; a higher-ranked
+  campaign with no live channel doesn't tear down a healthy watch; scan
+  errors back off (doubling, capped) and never interrupt the watch.
+  Other pick modes (`ending_soonest`, `low_avbl_first`) are unchanged.
+  The scan walks the ranking top-down: if the highest-ranked candidate
+  has no live channel, it keeps looking for the first actually-available
+  higher-priority target, with channel probes capped at 3 per scan to
+  bound GQL fan-out (worst case per scan: 1 campaign list + 1 inventory
+  + 3 channel probes). Scans resume round-robin across cycles
+  (`preemptCursor`) instead of restarting at the top, so a persistent
+  run of offline top candidates can't permanently starve the candidates
+  beneath the cap; preemption still only moves strictly up in rank, so
+  scans converge on the highest-ranked live target within
+  (ceil(H/3)+1) scan cycles, H = higher-ranked eligible candidates.
+
 ### Fixed
 
 - **Games whose Twitch directory slug differs from the guessed slug are
