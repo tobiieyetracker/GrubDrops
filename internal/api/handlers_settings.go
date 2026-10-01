@@ -524,7 +524,7 @@ func (d *settingsDeps) globalGamesAdd(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/priority", http.StatusSeeOther)
 		return
 	}
-	slug := gameslug.Slug(name)
+	slug := gameslug.TwitchSlug(name)
 	if slug == "" {
 		http.Redirect(w, r, "/priority", http.StatusSeeOther)
 		return

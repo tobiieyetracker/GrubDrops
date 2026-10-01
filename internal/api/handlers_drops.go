@@ -890,7 +890,7 @@ func (d *dropsDeps) addWhitelist(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	slug := gameslug.Slug(name)
+	slug := gameslug.TwitchSlug(name)
 	if slug == "" {
 		http.Redirect(w, r, "/drops", http.StatusSeeOther)
 		return

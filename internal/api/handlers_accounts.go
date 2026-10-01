@@ -266,7 +266,7 @@ func (d accountsDeps) addGame(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/accounts/"+id, http.StatusSeeOther)
 		return
 	}
-	slug := gameslug.Slug(name)
+	slug := gameslug.TwitchSlug(name)
 	if slug == "" {
 		http.Redirect(w, r, "/accounts/"+id, http.StatusSeeOther)
 		return

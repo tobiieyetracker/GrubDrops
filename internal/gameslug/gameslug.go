@@ -44,3 +44,34 @@ func Slug(name string) string {
 func ID(name string) string {
 	return "g_" + strings.ReplaceAll(Slug(name), "-", "_")
 }
+
+// twitchSlugFixups corrects the naive Slug() guess for games whose real
+// Twitch directory slug differs. Slug() is a local guess from the display
+// name; Twitch's canonical slug for these games is different, and the
+// directory query returns game=null for the guessed slug — silently
+// dropping every drop campaign of the game from discovery. Keyed by the
+// naive slug so both the display name and an already-slugified input hit
+// the same fixup. Verified 2026-10-01 via DirectoryPage_Game /
+// DirectoryGameRedirect against gql.twitch.tv:
+//   - "Rainbow Six Siege" -> tom-clancys-rainbow-six-siege (was: rainbow-six-siege)
+//   - "PUBG: Black Budget" -> project-bb (was: pubg-black-budget)
+//
+// Long-term this should be replaced by resolving slugs through the
+// DirectoryGameRedirect operation at runtime.
+var twitchSlugFixups = map[string]string{
+	"rainbow-six-siege": "tom-clancys-rainbow-six-siege",
+	"pubg-black-budget": "project-bb",
+}
+
+// TwitchSlug returns the slug to use for Twitch directory lookups
+// (DirectoryPage_Game). It is Slug() with the known-wrong guesses
+// corrected via twitchSlugFixups. ID() intentionally still derives from
+// the display name so existing game ids (g_rainbow_six_siege, …) are
+// stable; only the directory-lookup slug changes.
+func TwitchSlug(name string) string {
+	s := Slug(name)
+	if fix, ok := twitchSlugFixups[s]; ok {
+		return fix
+	}
+	return s
+}

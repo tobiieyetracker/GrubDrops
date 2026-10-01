@@ -130,12 +130,17 @@ func (d *discovery) listByChannels(ctx context.Context, sess platform.Session, c
 	// sess.Games may carry a game under more than one token — the discovery
 	// scraper's whitelist union emits both a game's lowercased display name
 	// and its lowercased slug (e.g. "grand theft auto v" AND
-	// "grand-theft-auto-v"), and gameslug.Slug maps both to the same value.
-	// Dedupe by slug (skipping empty ones) so a multi-word game doesn't
-	// double the DirectoryPage_Game + AvailableDrops fan-out every tick.
+	// "grand-theft-auto-v"), and gameslug.TwitchSlug maps both to the same
+	// directory slug. Dedupe by slug (skipping empty ones) so a multi-word
+	// game doesn't double the DirectoryPage_Game + AvailableDrops fan-out
+	// every tick.
 	seenSlugs := make(map[string]struct{}, len(sess.Games))
 	for _, game := range sess.Games {
-		slug := gameslug.Slug(game)
+		// TwitchSlug, not Slug: the naive guess is wrong for some games
+		// (Rainbow Six Siege's directory slug is
+		// tom-clancys-rainbow-six-siege, not rainbow-six-siege) and a
+		// wrong slug makes DirectoryPage_Game return game=null.
+		slug := gameslug.TwitchSlug(game)
 		if slug == "" {
 			continue
 		}

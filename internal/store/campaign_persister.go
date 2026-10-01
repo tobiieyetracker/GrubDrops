@@ -64,12 +64,15 @@ func (p *CampaignPersister) PersistCampaigns(ctx context.Context, camps []platfo
 		}
 		// Auto-upsert the game so it shows in the account whitelist
 		// picker even if not in the migration seed. Idempotent —
-		// existing rows keep their priority.
+		// existing rows keep their priority. TwitchSlug, not Slug: the
+		// naive guess is wrong for some games (Rainbow Six Siege's
+		// directory slug is tom-clancys-rainbow-six-siege), and writing
+		// the guessed slug would silently break directory discovery.
 		if c.Game != "" {
 			_ = p.Q.UpsertGame(ctx, gen.UpsertGameParams{
 				ID:       gameslug.ID(c.Game),
 				Name:     c.Game,
-				Slug:     gameslug.Slug(c.Game),
+				Slug:     gameslug.TwitchSlug(c.Game),
 				Priority: 100,
 			})
 		}
