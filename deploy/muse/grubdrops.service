@@ -1,0 +1,29 @@
+# GrubDrops systemd unit template for a Muse cloud VM.
+# Before installing: replace /home/USER, User=USER, Group=USER, and the proxy
+# host below with values for the target VM. Never put proxy credentials here.
+[Unit]
+Description=GrubDrops Twitch drops miner (localhost UI only)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=USER
+Group=USER
+WorkingDirectory=/home/USER/workspace/grubdrops
+ExecStart=/home/USER/workspace/grubdrops/bin/run-miner.sh
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+KillMode=control-group
+StandardOutput=append:/home/USER/workspace/grubdrops/logs/miner.log
+StandardError=append:/home/USER/workspace/grubdrops/logs/miner.log
+Environment=HTTP_PROXY=http://MUSE_EGRESS_PROXY_HOST:3128
+Environment=HTTPS_PROXY=http://MUSE_EGRESS_PROXY_HOST:3128
+Environment=NO_PROXY=localhost,127.0.0.1,::1
+Environment=TZ=UTC
+
+[Install]
+WantedBy=multi-user.target

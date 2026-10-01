@@ -131,6 +131,106 @@ Open **http://localhost:8080** and create the admin login.
 - **Every knob?** Reference compose: [`deploy/docker-compose.yml`](deploy/docker-compose.yml).
 - **Build it?** `docker build -f deploy/Dockerfile.miner .`, or `go build ./cmd/miner`.
 
+## Deploying on a Muse cloud VM
+
+This is a manual, best-effort Linux deployment. Before using another Muse VM,
+confirm that it provides Go 1.26.2+, systemd with permission to install a system
+unit, a persistent home directory, the required outbound network/proxy, and a
+supported way to reach the app's localhost-only UI. Some Muse environments do
+not provide local browser access or port forwarding; in that case you cannot
+finish the initial admin/Twitch setup from another device. Do not expose the UI
+to the public network to work around this.
+
+The source templates are in [`deploy/muse/`](deploy/muse/). They are examples
+to adapt to the target VM, not an installer. They run the Twitch path only; no
+Docker socket or Kick Chrome sidecar is configured.
+
+### Build and prepare
+
+```bash
+git clone https://github.com/tobiieyetracker/GrubDrops.git ~/workspace/grubdrops/src
+cd ~/workspace/grubdrops/src
+mkdir -p ../{bin,data,logs,secrets,systemd}
+go build -o ../bin/grubdrops ./cmd/miner
+(umask 077; ../bin/grubdrops keygen > ../secrets/master.key)
+chmod 600 ../secrets/master.key
+touch ../logs/miner.log
+cp deploy/muse/grubdrops.service ../systemd/
+cp deploy/muse/run-miner.sh deploy/muse/recover.sh ../bin/
+chmod +x ../bin/run-miner.sh ../bin/recover.sh
+```
+
+Edit the copied unit and scripts before starting them: replace `/home/USER`
+with the target account's home directory, replace `User=USER` and `Group=USER`
+with that Linux account and its primary group, and set the egress-proxy host
+provided by Muse. Do not put rotating proxy passwords in the unit or Git; use
+the platform's supported runtime secret mechanism. Configure any app-level
+proxy in **Settings → Proxy** after the UI is reachable. The key in
+`secrets/master.key` encrypts stored sessions; keep it private and retain the
+same key if reusing the same database. The database, key, account sessions,
+claims, and settings are runtime state and are not in Git.
+
+If you are migrating an existing installation, transfer its database and the
+matching master key through a private channel; cloning the source alone does
+not transfer account state.
+
+The unit binds the UI to `127.0.0.1:8080` over plain HTTP, so it sets
+`GRUB_SECURE_COOKIES=0`. Keep that binding private. Use an approved local access
+method to open the UI, create the admin login, then add Twitch through the
+device-code flow at `twitch.tv/activate`.
+
+Install/start the system unit (this step needs root permission):
+
+```bash
+sudo ~/workspace/grubdrops/bin/recover.sh
+curl -fsS http://127.0.0.1:8080/healthz
+sudo systemctl status grubdrops.service
+```
+
+### VM replacement and recovery
+
+In the Muse environment used for this deployment, files under the home
+directory are intended to persist across VM replacement; running processes,
+`/etc`, and the systemd link there do not. Verify those guarantees on the
+destination Muse. After a replacement, the files in `~/workspace/grubdrops/`
+can be used to recreate the unit and start the miner:
+
+```bash
+sudo ~/workspace/grubdrops/bin/recover.sh
+```
+
+The script restores the systemd link and checks `/healthz`; it does not install
+a scheduler. The currently observed Muse setup uses an external five-minute
+supervisor, which is not stored in this repository and will not transfer with
+a clone. If the target Muse offers a persistent scheduled-task facility, you
+can configure it separately to run recovery when the health check fails.
+Verify that scheduler survives VM replacement and has the privileges needed by
+systemd. Recovery is best-effort and can leave a gap during a VM replacement;
+Muse does not guarantee 7×24 uptime. Do not run two instances against the same
+Twitch account at the same time. When moving an account, stop the old watcher
+before starting the new one.
+
+### Health, logs, and updates
+
+```bash
+curl -fsS http://127.0.0.1:8080/healthz
+sudo systemctl status grubdrops.service
+sudo tail -f ~/workspace/grubdrops/logs/miner.log
+```
+
+To update source, build a replacement binary before restarting the service:
+
+```bash
+cd ~/workspace/grubdrops/src
+git pull --ff-only
+go build -o ../bin/grubdrops.new ./cmd/miner
+mv ../bin/grubdrops.new ../bin/grubdrops
+sudo systemctl restart grubdrops.service
+```
+
+Keep the database and master key in the persistent home directory; never add
+them, Twitch credentials, proxy credentials, or logs to a commit.
+
 ## Adding accounts
 
 Go to **Accounts** and add one per platform.
