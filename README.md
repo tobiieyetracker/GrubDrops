@@ -268,6 +268,75 @@ internal/api + web      HTMX UI and handlers
 internal/store          SQLite (sqlc + goose), age-encrypted sessions
 ```
 
+## Deploying on a Muse cloud VM
+
+Twitch-only systemd deployment — no Docker, no Kick sidecar. Reference scripts
+live in [`deploy/muse/`](deploy/muse/).
+
+### Setup
+
+```bash
+# 1. Clone and build (Go 1.26+)
+git clone https://github.com/tobiieyetracker/Grubdrops.git ~/workspace/grubdrops/src
+cd ~/workspace/grubdrops/src
+go build -o ../bin/grubdrops ./cmd/miner
+
+# 2. Layout + secrets (never commit these)
+mkdir -p ~/workspace/grubdrops/{bin,data,logs,secrets,systemd}
+../bin/grubdrops keygen > ~/workspace/grubdrops/secrets/master.key
+chmod 600 ~/workspace/grubdrops/secrets/master.key
+# put your admin password in ~/workspace/grubdrops/secrets/admin-password (chmod 600)
+
+# 3. Install the unit templates (replace /home/USER with your home dir first)
+cp deploy/muse/grubdrops.service ~/workspace/grubdrops/systemd/
+cp deploy/muse/run-miner.sh deploy/muse/recover.sh ~/workspace/grubdrops/bin/
+chmod +x ~/workspace/grubdrops/bin/*.sh
+
+# 4. Start
+~/workspace/grubdrops/bin/recover.sh   # links /etc/systemd unit, starts service, probes /healthz
+```
+
+**Twitch login** is device-code only: add the account, approve at
+`twitch.tv/activate`. The session lands age-encrypted in `data/miner.db`.
+
+### VM replacement
+
+The VM may be replaced on platform updates. `~/` persists; `/etc`, systemd
+links, and running processes do **not**. After a replacement, re-run:
+
+```bash
+~/workspace/grubdrops/bin/recover.sh
+```
+
+It's idempotent. A 5-minute cron can probe `/healthz` and run it on failure,
+but treat recovery as best-effort — expect a few minutes of downtime per
+replacement. Do not claim 7×24.
+
+### Health and logs
+
+```bash
+curl -s http://127.0.0.1:8080/healthz
+systemctl status grubdrops.service
+tail -f ~/workspace/grubdrops/logs/miner.log   # JSON lines
+```
+
+### Network constraints
+
+- Egress-only via `http://hatch-egress-proxy:3128` (no credentials baked in —
+  the proxy password rotates). Set it under Settings → Proxy; the watch leg
+  additionally needs `HTTP_PROXY`/`HTTPS_PROXY` in the environment (see the
+  unit template).
+- No public inbound port and no supported localhost forwarding from the Muse
+  side — the UI (`127.0.0.1:8080`) is reachable only from the VM itself.
+
+### Source vs. runtime state
+
+| In git (safe to clone) | On the VM only (never commit) |
+|---|---|
+| Go source, `deploy/muse/` scripts, docs | `secrets/` (master key, admin password) |
+| | `data/miner.db` (sessions, claims, settings) |
+| | `logs/`, Twitch tokens, proxy credentials |
+
 ## Credits
 
 Stands on the projects that cracked the hard parts first:

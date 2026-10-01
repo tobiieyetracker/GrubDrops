@@ -1,0 +1,42 @@
+# GrubDrops — systemd unit template for Muse cloud VMs.
+#
+# INSTALL:
+#   1. Replace every occurrence of /home/USER with your actual home directory
+#      (e.g. /home/hatch).
+#   2. Copy your adapted files to ~/workspace/grubdrops/:
+#        deploy/muse/grubdrops.service -> ~/workspace/grubdrops/systemd/grubdrops.service
+#        deploy/muse/run-miner.sh      -> ~/workspace/grubdrops/bin/run-miner.sh
+#        deploy/muse/recover.sh        -> ~/workspace/grubdrops/bin/recover.sh
+#   3. Run ~/workspace/grubdrops/bin/recover.sh (re-links /etc, starts service).
+#
+# Twitch-only: no docker socket is mounted, so no Kick sidecars can be created.
+# UI listens on 127.0.0.1:8080 only — localhost, no public port.
+[Unit]
+Description=GrubDrops Twitch drops miner (localhost UI only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/USER/workspace/grubdrops/bin/run-miner.sh
+WorkingDirectory=/home/USER/workspace/grubdrops
+Restart=on-failure
+RestartSec=15
+StartLimitIntervalSec=600
+StartLimitBurst=5
+TimeoutStopSec=30
+KillMode=control-group
+StandardOutput=append:/home/USER/workspace/grubdrops/logs/miner.log
+StandardError=append:/home/USER/workspace/grubdrops/logs/miner.log
+# Secrets are NOT in this unit: the wrapper reads GRUB_MASTER_KEY from
+# secrets/master.key (0600) at process start.
+# The watch leg (StartWatch/heartbeats/beacons) uses Go's default transport
+# by upstream design ("beacons stay off the proxy"). If your sandbox has no
+# direct egress, route it through the egress proxy via env. The main backend
+# already uses its explicit proxy transport (env is ignored there).
+Environment=HTTP_PROXY=http://hatch-egress-proxy:3128
+Environment=HTTPS_PROXY=http://hatch-egress-proxy:3128
+Environment=NO_PROXY=localhost,127.0.0.1,::1
+
+[Install]
+WantedBy=default.target
