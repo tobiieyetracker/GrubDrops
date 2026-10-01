@@ -4,6 +4,21 @@ All notable changes to GrubDrops.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Games whose Twitch directory slug differs from the guessed slug are
+  discovered again.** Directory lookups built the slug locally from the
+  display name (`gameslug.Slug`), but Twitch's canonical slug doesn't always
+  match — `Rainbow Six Siege` lives at `tom-clancys-rainbow-six-siege`, not
+  `rainbow-six-siege`, and `PUBG: Black Budget` lives at `project-bb`, not
+  `pubg-black-budget`. The directory query returned `game: null` for the
+  wrong slug, so discovery silently found zero channels and zero campaigns
+  for those games (and the watcher's empty-allow-list channel fallback hit
+  the same dead end). New `gameslug.TwitchSlug` corrects the known-wrong
+  guesses; discovery, the watcher fallback, the campaign persister, and the
+  game upsert endpoints all use it now. Game ids (`g_rainbow_six_siege`, …)
+  are unchanged.
+
 ## [1.4.2] — 2026-09-28
 
 ### Fixed

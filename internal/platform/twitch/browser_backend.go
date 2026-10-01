@@ -412,7 +412,9 @@ func (b *BrowserBackend) ListEligibleChannels(ctx context.Context, s platform.Se
 	// Fall back to game directory when allow.channels is empty —
 	// same logic as Backend.ListEligibleChannels. Most public drop
 	// campaigns (Minecraft etc) have no channel restriction.
-	return a.chans.listForGameDirectory(ctx, s, gameslug.Slug(c.Game))
+	// TwitchSlug, not Slug: the naive guess is wrong for some games
+	// (e.g. Rainbow Six Siege).
+	return a.chans.listForGameDirectory(ctx, s, gameslug.TwitchSlug(c.Game))
 }
 
 func (b *BrowserBackend) InventoryProgress(ctx context.Context, s platform.Session) ([]platform.Progress, error) {

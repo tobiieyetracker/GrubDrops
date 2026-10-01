@@ -411,8 +411,9 @@ func (b *Backend) ListEligibleChannels(ctx context.Context, s platform.Session, 
 	// Empty allow-list = campaign accepts ANY live drops-enabled stream
 	// of the game. Fall back to the DirectoryPage_Game query — without
 	// this most public campaigns (Minecraft, Apex, etc) have nothing
-	// to watch and the watcher sleeps forever.
-	slug := gameslug.Slug(c.Game)
+	// to watch and the watcher sleeps forever. TwitchSlug, not Slug:
+	// the naive guess is wrong for some games (e.g. Rainbow Six Siege).
+	slug := gameslug.TwitchSlug(c.Game)
 	return b.chans.listForGameDirectory(ctx, s, slug)
 }
 
