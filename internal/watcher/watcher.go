@@ -282,6 +282,23 @@ type Watcher struct {
 	// against the resulting double-notify. Keyed by reward Title (the only
 	// stable identifier ClaimedReward carries). Lazily allocated.
 	notifiedSwept map[string]struct{}
+
+	// preemptIn counts down tickWatch ticks until the next ordered-mode
+	// priority-preemption scan. Reset to preemptRecheckEveryTicks()
+	// whenever a fresh watch starts (pickStream) and after every clean
+	// scan; stretched by the error backoff on scan failures.
+	preemptIn int
+	// preemptErrs counts consecutive preemption-scan failures. Drives
+	// the backoff multiplier (2^preemptErrs, capped) applied to the
+	// next scan delay so a flapping backend can't hammer GQL.
+	preemptErrs int
+	// preemptCursor is the campaign ID of the last channel probe in the
+	// previous preemption scan. The next scan resumes after it
+	// (round-robin) instead of restarting at the top, so a long tail of
+	// offline higher-ranked campaigns can't permanently starve the
+	// lower — but still higher-than-current — candidates below the
+	// per-scan probe cap. Empty means "start from the top".
+	preemptCursor string
 }
 
 func New(cfg Config) *Watcher {
@@ -857,6 +874,31 @@ const freezeThreshold = 5
 // stall (channel-side hiccup) has likely cleared.
 const stalledChannelCooldown = 30 * time.Minute
 
+// preemptRecheckEvery is the wall-clock cadence of the ordered-mode
+// priority-preemption scan during StateWatching. One scan costs one
+// ListActiveCampaigns + one InventoryProgress + up to one
+// ListEligibleChannels — at 2min against the routine ~4 calls/min
+// (beacon + inventory + live-checks) that's ~+40% request volume, well
+// inside the DevilXD-parity budget. A var (like stepErrBackoff) only so
+// tests can shrink it.
+var preemptRecheckEvery = 2 * time.Minute
+
+// preemptMaxBackoffMult caps the error-backoff multiplier for the
+// preemption scan: after N consecutive scan failures the next scan is
+// delayed by 2^N check intervals, at most this multiplier.
+const preemptMaxBackoffMult = 8
+
+// maxPreemptChannelProbes caps how many higher-ranked candidates get a
+// ListEligibleChannels probe per preemption scan. The scan walks the
+// ranked list top-down and stops at the first candidate with a live
+// drops-enabled channel; without a cap, a long tail of offline
+// higher-ranked campaigns would turn every scan into a GQL fan-out.
+// 3 keeps the worst case at 1 (campaigns) + 1 (inventory) + 3
+// (channels) = 5 calls per ~2min scan. Scans resume round-robin from
+// preemptCursor, so the cap can delay — but never permanently starve —
+// lower candidates.
+const maxPreemptChannelProbes = 3
+
 func (w *Watcher) step(ctx context.Context) error {
 	switch w.State() {
 	case StateIdle, StatePickCampaign:
@@ -1358,15 +1400,13 @@ func (w *Watcher) pickCampaign(ctx context.Context) error {
 			return ai < aj
 		})
 	} else if w.cfg.GameRank != nil {
+		// Strict whitelist order: the priority list alone decides.
+		// Same-rank campaigns keep their discovery order (stable
+		// sort) — no remaining-minutes tiebreak, so an in-progress
+		// campaign is never preempted by one closer to claim.
 		sort.SliceStable(matched, func(i, j int) bool {
 			ri := w.cfg.GameRank(matched[i].Game)
 			rj := w.cfg.GameRank(matched[j].Game)
-			if ri == rj {
-				// P5 tiebreak: same whitelist rank → prefer the
-				// campaign with the fewest minutes remaining to claim
-				// (already in progress > unstarted).
-				return campaignMinRemaining(matched[i], progressByID) < campaignMinRemaining(matched[j], progressByID)
-			}
 			return ri < rj
 		})
 	}
@@ -1613,6 +1653,10 @@ func (w *Watcher) pickStream(ctx context.Context) error {
 	// Reset the tick counter so the beacon/inventory cadence (tickN==1
 	// fires immediately) aligns with the start of each watch session.
 	w.tickCount = 0
+	// Arm the ordered-mode preemption scan for this watch session.
+	w.preemptIn = w.preemptRecheckEveryTicks()
+	w.preemptCursor = "" // fresh watch: preemption scans restart at the top
+	w.preemptErrs = 0
 	w.mu.Unlock()
 	// Subscribe to video-playback PubSub so stream-down events fire
 	// the moment Twitch flips the broadcast off, without waiting for
@@ -1622,6 +1666,275 @@ func (w *Watcher) pickStream(ctx context.Context) error {
 	}
 	w.setState(ctx, StateWatching)
 	return nil
+}
+
+// preemptRecheckEveryTicks is the ordered-mode preemption scan cadence
+// expressed in ticks of TickInterval.
+func (w *Watcher) preemptRecheckEveryTicks() int {
+	return everyTicks(preemptRecheckEvery, w.cfg.TickInterval, 2*time.Minute)
+}
+
+// orderedMode reports whether the watcher picks in priority-list
+// ("ordered") mode — the only mode where dynamic preemption applies.
+// Mirrors pickCampaign's mode dispatch: any other explicit mode, or a
+// missing GameRank, disables preemption.
+func (w *Watcher) orderedMode() bool {
+	if w.cfg.PriorityMode == "ending_soonest" || w.cfg.PriorityMode == "low_avbl_first" {
+		return false
+	}
+	return w.cfg.GameRank != nil
+}
+
+// maybePreempt runs one ordered-mode priority-preemption scan. If a
+// strictly higher-ranked game currently has an eligible campaign with a
+// live drops-enabled channel, the current watch is stopped cleanly and
+// the watcher returns to PickCampaign — without waiting for the current
+// drop to complete. Server-side progress is untouched (minutes already
+// credited stay with the account) and no claim is triggered. Returns
+// true when it preempted (caller must return immediately). Scan errors
+// back off the next scan (doubling, capped) and never interrupt the
+// current watch; an error is never treated as "no candidates", and no
+// candidates simply keeps the current watch.
+func (w *Watcher) maybePreempt(ctx context.Context) bool {
+	interval := w.preemptRecheckEveryTicks()
+	// rearm pushes the next scan out by interval*mult ticks. Every path
+	// below re-arms exactly once.
+	rearm := func(mult int) {
+		w.mu.Lock()
+		w.preemptIn = interval * mult
+		w.mu.Unlock()
+	}
+
+	w.mu.Lock()
+	cur := w.currentCampaign
+	w.mu.Unlock()
+	if cur == nil {
+		rearm(1)
+		return false
+	}
+	curRank := w.cfg.GameRank(cur.Game)
+
+	campaigns, err := w.cfg.Backend.ListActiveCampaigns(ctx, w.cfg.Session)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			rearm(1)
+			return false
+		}
+		w.mu.Lock()
+		w.preemptErrs++
+		mult := 1 << w.preemptErrs
+		if mult > preemptMaxBackoffMult {
+			mult = preemptMaxBackoffMult
+		}
+		w.mu.Unlock()
+		slog.Warn("watcher preemption scan failed; keeping current watch",
+			"kind", "error", "account", w.cfg.AccountID, "err", err)
+		rearm(mult)
+		return false
+	}
+
+	// Claim-state for the eligibility filter, mirroring pickCampaign. A
+	// failed inventory fetch degrades to "no claim info" (the durable
+	// ownClaimed set still applies) rather than aborting the scan.
+	var progress []platform.Progress
+	if len(campaigns) > 0 {
+		if p, perr := w.cfg.Backend.InventoryProgress(ctx, w.cfg.Session); perr == nil {
+			progress = p
+		} else if !errors.Is(perr, context.Canceled) && ctx.Err() == nil {
+			slog.Warn("watcher preemption inventory failed; continuing without claim filter",
+				"kind", "error", "account", w.cfg.AccountID, "err", perr)
+		}
+	}
+	claimed := make(map[string]bool, len(progress))
+	for _, p := range progress {
+		if p.Claimed {
+			claimed[p.BenefitID] = true
+		}
+	}
+	var ownClaimed map[string]bool
+	if cr, ok := w.cfg.ClaimRecorder.(interface {
+		ClaimedBenefitIDs(context.Context, string) (map[string]bool, error)
+	}); ok {
+		if ids, cerr := cr.ClaimedBenefitIDs(ctx, w.cfg.AccountID); cerr == nil {
+			ownClaimed = ids
+		}
+	}
+
+	// Walk eligible candidates highest-rank first; preempt on the first
+	// strictly higher-ranked one that has a live drops-enabled channel
+	// right now. Same/lower rank never preempts. Confirming a live
+	// channel before tearing down a healthy watch avoids churn when the
+	// higher campaign's broadcasters are all offline (pickCampaign would
+	// fall straight back to the current target anyway).
+	//
+	// The walk is round-robin across scans: it resumes after
+	// preemptCursor (the last probed campaign of the previous scan)
+	// instead of restarting at the top every time. Otherwise a
+	// persistent run of offline top candidates below the per-scan probe
+	// cap would permanently starve the candidates beneath them.
+	// Because preemption only ever moves strictly up in rank and the
+	// cursor resets on every preemption, the scan converges on the
+	// highest-ranked live target within a bounded number of scans.
+	var higher []platform.Campaign
+	for _, c := range w.preemptCandidates(campaigns, claimed, ownClaimed) {
+		if w.cfg.GameRank(c.Game) < curRank {
+			higher = append(higher, c)
+		}
+	}
+	start := 0
+	w.mu.Lock()
+	cursor := w.preemptCursor
+	w.mu.Unlock()
+	if cursor != "" {
+		for i, c := range higher {
+			if c.ID == cursor {
+				start = i + 1
+				break
+			}
+		}
+	}
+	if start >= len(higher) {
+		start = 0 // wrapped: a full cycle completed, restart at the top
+	}
+
+	var target *platform.Campaign
+	probed := 0
+	lastProbed := ""
+	for _, c := range higher[start:] {
+		if probed >= maxPreemptChannelProbes {
+			slog.Debug("watcher preemption probe cap reached; resuming next scan",
+				"account", w.cfg.AccountID, "cap", maxPreemptChannelProbes,
+				"cursor", c.ID)
+			break
+		}
+		probed++
+		lastProbed = c.ID
+		streams, serr := w.cfg.Backend.ListEligibleChannels(ctx, w.cfg.Session, c)
+		if serr != nil {
+			if errors.Is(serr, context.Canceled) || ctx.Err() != nil {
+				rearm(1)
+				return false
+			}
+			w.mu.Lock()
+			w.preemptErrs++
+			mult := 1 << w.preemptErrs
+			if mult > preemptMaxBackoffMult {
+				mult = preemptMaxBackoffMult
+			}
+			w.mu.Unlock()
+			slog.Warn("watcher preemption channel check failed; keeping current watch",
+				"kind", "error", "account", w.cfg.AccountID, "campaign", c.Name, "err", serr)
+			rearm(mult)
+			return false
+		}
+		if len(streams) == 0 {
+			continue
+		}
+		cp := c
+		target = &cp
+		break
+	}
+
+	w.mu.Lock()
+	w.preemptErrs = 0
+	if target != nil || start+probed >= len(higher) {
+		// Preempted (the higher-than-current set changes anyway) or a
+		// full cycle finished with no live channel: restart at the top.
+		w.preemptCursor = ""
+	} else {
+		w.preemptCursor = lastProbed
+	}
+	w.mu.Unlock()
+	rearm(1)
+	if target == nil {
+		return false
+	}
+	slog.Info("watcher preempting to higher-priority campaign",
+		"kind", "state", "account", w.cfg.AccountID,
+		"from_game", cur.Game, "from_campaign", cur.Name,
+		"to_game", target.Game, "to_campaign", target.Name)
+	// Clean stop: halt beacons and drop the PubSub sub via
+	// stopCurrentWatch, then clear the pick state — but trigger no claim
+	// and clear no progress. Minutes already credited server-side stay
+	// with the account. The next pickCampaign re-picks from scratch and
+	// lands on the higher-priority target.
+	w.stopCurrentWatch(ctx)
+	w.mu.Lock()
+	w.currentBenefit = nil
+	w.currentCampaign = nil
+	w.tickCount = 0
+	w.noAdvanceTicks = 0
+	w.noProgressTicks = 0
+	w.lastProgressMin = 0
+	w.mu.Unlock()
+	w.setState(ctx, StatePickCampaign)
+	return true
+}
+
+// preemptCandidates returns the eligible mining candidates for the
+// preemption scan, sorted by GameRank ascending (highest priority
+// first). It mirrors pickCampaign's mining filter but is strictly
+// read-only: no DB writes, no claim reconciliation, no skips recorded.
+func (w *Watcher) preemptCandidates(campaigns []platform.Campaign, claimed, ownClaimed map[string]bool) []platform.Campaign {
+	var out []platform.Campaign
+	for _, c := range campaigns {
+		if w.cfg.AllowGame != nil || w.cfg.AllowChannel != nil {
+			gameOK := w.cfg.AllowGame != nil && w.cfg.AllowGame(c.Game)
+			chanOK := w.cfg.AllowChannel != nil && w.cfg.AllowChannel(c.AllowedChannels)
+			if !gameOK && !chanOK {
+				continue
+			}
+		}
+		if c.Status != "" && c.Status != "active" {
+			continue
+		}
+		// Reward campaigns accrue no watch-time; the reward reaper
+		// handles them out-of-band.
+		if c.Kind == "reward" {
+			continue
+		}
+		if (c.Platform == "twitch" || c.AccountLinkChecked) && !c.AccountLinked {
+			if w.cfg.ForceLinked == nil || !w.cfg.ForceLinked(c.ID) {
+				continue
+			}
+		}
+		if w.cfg.ExcludeGame != nil && w.cfg.ExcludeGame(c.Game) {
+			continue
+		}
+		if !w.campaignHasMineableBenefit(c, claimed, ownClaimed) {
+			continue
+		}
+		out = append(out, c)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return w.cfg.GameRank(out[i].Game) < w.cfg.GameRank(out[j].Game)
+	})
+	return out
+}
+
+// campaignHasMineableBenefit reports whether the campaign has at least
+// one watch-time benefit the account could mine right now: watch-time
+// gated, unclaimed (inventory + durable claims), not skipped, and with
+// preconditions met.
+func (w *Watcher) campaignHasMineableBenefit(c platform.Campaign, claimed, ownClaimed map[string]bool) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, b := range c.Benefits {
+		if b.RequiredMinutes <= 0 {
+			continue
+		}
+		if claimed[b.ID] || ownClaimed[b.ID] {
+			continue
+		}
+		if _, skip := w.skippedBenefits[b.ID]; skip {
+			continue
+		}
+		if unmet := firstUnmetPrecondition(b.Preconditions, claimed); unmet != "" {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func (w *Watcher) tickWatch(ctx context.Context) error {
@@ -1682,6 +1995,22 @@ func (w *Watcher) tickWatch(ctx context.Context) error {
 				w.setState(ctx, StatePickStream)
 				return nil
 			}
+		}
+	}
+
+	// Ordered-mode priority preemption: every preemptRecheckEveryTicks,
+	// re-scan for a strictly higher-ranked eligible campaign with a live
+	// drops-enabled channel and yield the current watch to it — without
+	// waiting for the current drop to complete. Other pick modes never
+	// preempt; scan errors back off (inside maybePreempt) without
+	// disturbing the current watch.
+	if w.orderedMode() {
+		w.mu.Lock()
+		w.preemptIn--
+		due := w.preemptIn <= 0
+		w.mu.Unlock()
+		if due && w.maybePreempt(ctx) {
+			return nil
 		}
 	}
 

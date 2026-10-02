@@ -1764,3 +1764,573 @@ func TestWatcher_GhostSkip_SelfHealsWhenBenefitReappears(t *testing.T) {
 	w.mu.Unlock()
 	assert.False(t, stillSkipped, "healme must be removed from skippedBenefits after self-heal")
 }
+
+// ---- ordered-mode priority preemption tests ----
+
+// preemptTestBackend is a controllable platform.Backend for preemption
+// tests: the campaign set, channel map and failure modes can change
+// mid-run while the watcher is live.
+type preemptTestBackend struct {
+	mu            sync.Mutex
+	campaigns     []platform.Campaign
+	campaignErr   error
+	progress      map[string]int
+	claimed       map[string]bool
+	inventoryErr  error
+	channels      map[string][]platform.Stream
+	channelErr    error
+	channelProbes map[string]int // ListEligibleChannels calls per campaign ID
+	started       []string       // channels StartWatch was called on, in order
+	stopped       []string       // channels StopWatch was called on, in order
+	claimCalls    []string       // benefit IDs Claim was called with, in order
+}
+
+func (b *preemptTestBackend) Name() string { return "preempt-test" }
+func (b *preemptTestBackend) StartDeviceLogin(_ context.Context) (platform.DeviceChallenge, error) {
+	return platform.DeviceChallenge{}, nil
+}
+func (b *preemptTestBackend) PollDeviceLogin(_ context.Context, _ platform.DeviceChallenge) (platform.Session, error) {
+	return platform.Session{}, nil
+}
+func (b *preemptTestBackend) LoginViaBrowser(_ context.Context, _ platform.BrowserRPC) (platform.Session, error) {
+	return platform.Session{}, nil
+}
+func (b *preemptTestBackend) RefreshSession(_ context.Context, s platform.Session) (platform.Session, error) {
+	return s, nil
+}
+func (b *preemptTestBackend) ListActiveCampaigns(_ context.Context, _ platform.Session) ([]platform.Campaign, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.campaignErr != nil {
+		return nil, b.campaignErr
+	}
+	return append([]platform.Campaign(nil), b.campaigns...), nil
+}
+func (b *preemptTestBackend) ListEligibleChannels(_ context.Context, _ platform.Session, c platform.Campaign) ([]platform.Stream, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.channelProbes == nil {
+		b.channelProbes = map[string]int{}
+	}
+	b.channelProbes[c.ID]++
+	if b.channelErr != nil {
+		return nil, b.channelErr
+	}
+	return append([]platform.Stream(nil), b.channels[c.ID]...), nil
+}
+func (b *preemptTestBackend) InventoryProgress(_ context.Context, _ platform.Session) ([]platform.Progress, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.inventoryErr != nil {
+		return nil, b.inventoryErr
+	}
+	out := make([]platform.Progress, 0, len(b.progress))
+	for id, m := range b.progress {
+		out = append(out, platform.Progress{BenefitID: id, MinutesWatched: m, Claimed: b.claimed[id]})
+	}
+	return out, nil
+}
+func (b *preemptTestBackend) StartWatch(_ context.Context, _ platform.Session, s platform.Stream) (platform.WatchHandle, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.started = append(b.started, s.Channel)
+	return platform.WatchHandle{Channel: s.Channel}, nil
+}
+func (b *preemptTestBackend) Heartbeat(_ context.Context, _ platform.WatchHandle) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for id := range b.progress {
+		b.progress[id]++
+	}
+	return nil
+}
+func (b *preemptTestBackend) StopWatch(_ context.Context, h platform.WatchHandle) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.stopped = append(b.stopped, h.Channel)
+	return nil
+}
+func (b *preemptTestBackend) Claim(_ context.Context, _ platform.Session, d platform.DropBenefit) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.claimCalls = append(b.claimCalls, d.ID)
+	b.claimed[d.ID] = true
+	return nil
+}
+
+func (b *preemptTestBackend) setCampaigns(cs []platform.Campaign) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.campaigns = cs
+}
+func (b *preemptTestBackend) setChannels(m map[string][]platform.Stream) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.channels = m
+}
+func (b *preemptTestBackend) setCampaignErr(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.campaignErr = err
+}
+func (b *preemptTestBackend) calls() (started, stopped, claims []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.started...), append([]string(nil), b.stopped...), append([]string(nil), b.claimCalls...)
+}
+func (b *preemptTestBackend) progressOf(id string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.progress[id]
+}
+func (b *preemptTestBackend) probeCount(ids ...string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	total := 0
+	for _, id := range ids {
+		total += b.channelProbes[id]
+	}
+	return total
+}
+
+func preemptCampaign(id, game, benefitID string, reqMin int) platform.Campaign {
+	return platform.Campaign{
+		ID: id, Game: game, Name: game + " campaign", Status: "active",
+		Platform: "twitch", AccountLinked: true,
+		Benefits: []platform.DropBenefit{
+			{ID: benefitID, CampaignID: id, Name: benefitID + " drop", RequiredMinutes: reqMin},
+		},
+	}
+}
+
+func preemptRank(game string) int {
+	switch game {
+	case "GameA":
+		return 0
+	case "GameB":
+		return 1
+	case "GameC":
+		return 2
+	}
+	return 1 << 30
+}
+
+// startPreemptWatcher builds a watcher with a shrunken preemption scan
+// interval and runs it; the caller must cancel ctx AND wait on done
+// before the test returns so the shrunken package var is restored only
+// after the watcher goroutine has exited.
+func startPreemptWatcher(t *testing.T, backend *preemptTestBackend, mode string) (*Watcher, context.Context, context.CancelFunc, chan struct{}) {
+	t.Helper()
+	old := preemptRecheckEvery
+	preemptRecheckEvery = 30 * time.Millisecond
+	t.Cleanup(func() { preemptRecheckEvery = old })
+	w := New(Config{
+		AccountID:    "acc_preempt",
+		Backend:      backend,
+		Session:      platform.Session{AccessToken: "tok"},
+		Notifier:     &recordingNotifier{},
+		TickInterval: 10 * time.Millisecond,
+		AllowGame:    func(g string) bool { return true },
+		GameRank:     preemptRank,
+		PriorityMode: mode,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	done := make(chan struct{})
+	go func() { defer close(done); _ = w.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+	return w, ctx, cancel, done
+}
+
+func waitWatchingCampaign(t *testing.T, w *Watcher, campaignID string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		snap := w.Snapshot()
+		return snap.State == StateWatching.String() && snap.CampaignID == campaignID
+	}, 3*time.Second, 5*time.Millisecond, "watcher should be watching %s", campaignID)
+}
+
+// TestWatcher_PreemptHigherPriorityCampaign: watching a lower-priority
+// game, a higher-priority game campaign with a live drops channel
+// appears — the watcher must stop the current watch and switch without
+// waiting for the current drop to complete.
+func TestWatcher_PreemptHigherPriorityCampaign(t *testing.T) {
+	campB := preemptCampaign("campB", "GameB", "dropB", 1000)
+	backend := &preemptTestBackend{
+		campaigns: []platform.Campaign{campB},
+		progress:  map[string]int{"dropB": 0},
+		claimed:   map[string]bool{},
+		channels:  map[string][]platform.Stream{"campB": {{Channel: "streamerB", DropsEnabled: true}}},
+	}
+	w, _, _, _ := startPreemptWatcher(t, backend, "ordered")
+	waitWatchingCampaign(t, w, "campB")
+
+	campA := preemptCampaign("campA", "GameA", "dropA", 1000)
+	backend.setCampaigns([]platform.Campaign{campB, campA})
+	backend.setChannels(map[string][]platform.Stream{
+		"campB": {{Channel: "streamerB", DropsEnabled: true}},
+		"campA": {{Channel: "streamerA", DropsEnabled: true}},
+	})
+	backend.progress["dropA"] = 0
+
+	waitWatchingCampaign(t, w, "campA")
+
+	started, stopped, _ := backend.calls()
+	assert.Contains(t, stopped, "streamerB", "old watch must be stopped on preemption")
+	assert.Contains(t, started, "streamerA", "watcher must start watching the higher-priority campaign")
+}
+
+// TestWatcher_NoPreemptSameRank: a new campaign for the SAME game
+// (same whitelist rank) must not preempt the current watch.
+func TestWatcher_NoPreemptSameRank(t *testing.T) {
+	campB := preemptCampaign("campB", "GameB", "dropB", 1000)
+	backend := &preemptTestBackend{
+		campaigns: []platform.Campaign{campB},
+		progress:  map[string]int{"dropB": 0},
+		claimed:   map[string]bool{},
+		channels:  map[string][]platform.Stream{"campB": {{Channel: "streamerB", DropsEnabled: true}}},
+	}
+	w, _, _, _ := startPreemptWatcher(t, backend, "ordered")
+	waitWatchingCampaign(t, w, "campB")
+
+	campB2 := preemptCampaign("campB2", "GameB", "dropB2", 1000)
+	backend.setCampaigns([]platform.Campaign{campB, campB2})
+	backend.setChannels(map[string][]platform.Stream{
+		"campB":  {{Channel: "streamerB", DropsEnabled: true}},
+		"campB2": {{Channel: "streamerB2", DropsEnabled: true}},
+	})
+	backend.progress["dropB2"] = 0
+
+	time.Sleep(300 * time.Millisecond) // several scan rounds
+	snap := w.Snapshot()
+	assert.Equal(t, "campB", snap.CampaignID, "same-rank campaign must not preempt")
+	_, stopped, _ := backend.calls()
+	assert.Empty(t, stopped, "no watch should be stopped")
+}
+
+// TestWatcher_NoPreemptLowerRank: a lower-priority game campaign must
+// not preempt the current watch.
+func TestWatcher_NoPreemptLowerRank(t *testing.T) {
+	campB := preemptCampaign("campB", "GameB", "dropB", 1000)
+	backend := &preemptTestBackend{
+		campaigns: []platform.Campaign{campB},
+		progress:  map[string]int{"dropB": 0},
+		claimed:   map[string]bool{},
+		channels:  map[string][]platform.Stream{"campB": {{Channel: "streamerB", DropsEnabled: true}}},
+	}
+	w, _, _, _ := startPreemptWatcher(t, backend, "ordered")
+	waitWatchingCampaign(t, w, "campB")
+
+	campC := preemptCampaign("campC", "GameC", "dropC", 1000)
+	backend.setCampaigns([]platform.Campaign{campB, campC})
+	backend.setChannels(map[string][]platform.Stream{
+		"campB": {{Channel: "streamerB", DropsEnabled: true}},
+		"campC": {{Channel: "streamerC", DropsEnabled: true}},
+	})
+	backend.progress["dropC"] = 0
+
+	time.Sleep(300 * time.Millisecond)
+	snap := w.Snapshot()
+	assert.Equal(t, "campB", snap.CampaignID, "lower-rank campaign must not preempt")
+	_, stopped, _ := backend.calls()
+	assert.Empty(t, stopped, "no watch should be stopped")
+}
+
+// TestWatcher_NoPreemptWithoutCandidates: with no higher-priority
+// candidate the watcher keeps its current target.
+func TestWatcher_NoPreemptWithoutCandidates(t *testing.T) {
+	campB := preemptCampaign("campB", "GameB", "dropB", 1000)
+	backend := &preemptTestBackend{
+		campaigns: []platform.Campaign{campB},
+		progress:  map[string]int{"dropB": 0},
+		claimed:   map[string]bool{},
+		channels:  map[string][]platform.Stream{"campB": {{Channel: "streamerB", DropsEnabled: true}}},
+	}
+	w, _, _, _ := startPreemptWatcher(t, backend, "ordered")
+	waitWatchingCampaign(t, w, "campB")
+
+	time.Sleep(300 * time.Millisecond) // several scan rounds, nothing higher appears
+	snap := w.Snapshot()
+	assert.Equal(t, StateWatching.String(), snap.State)
+	assert.Equal(t, "campB", snap.CampaignID)
+	_, stopped, _ := backend.calls()
+	assert.Empty(t, stopped, "no watch should be stopped")
+}
+
+// TestWatcher_NoPreemptWhenHigherHasNoLiveChannel: a higher-priority
+// campaign whose channels are all offline must not tear down a healthy
+// watch (pickCampaign would fall straight back to the current target).
+func TestWatcher_NoPreemptWhenHigherHasNoLiveChannel(t *testing.T) {
+	campB := preemptCampaign("campB", "GameB", "dropB", 1000)
+	backend := &preemptTestBackend{
+		campaigns: []platform.Campaign{campB},
+		progress:  map[string]int{"dropB": 0},
+		claimed:   map[string]bool{},
+		channels:  map[string][]platform.Stream{"campB": {{Channel: "streamerB", DropsEnabled: true}}},
+	}
+	w, _, _, _ := startPreemptWatcher(t, backend, "ordered")
+	waitWatchingCampaign(t, w, "campB")
+
+	campA := preemptCampaign("campA", "GameA", "dropA", 1000)
+	backend.setCampaigns([]platform.Campaign{campB, campA})
+	// campA deliberately has no live channels.
+	backend.setChannels(map[string][]platform.Stream{
+		"campB": {{Channel: "streamerB", DropsEnabled: true}},
+	})
+	backend.progress["dropA"] = 0
+
+	time.Sleep(300 * time.Millisecond)
+	snap := w.Snapshot()
+	assert.Equal(t, "campB", snap.CampaignID, "higher-rank campaign with no live channel must not preempt")
+	_, stopped, _ := backend.calls()
+	assert.Empty(t, stopped, "no watch should be stopped")
+}
+
+// TestWatcher_PreemptScanErrorBacksOff: a transient discovery failure
+// must keep the current watch (never treated as "no candidates") and
+// the scanner must recover once the backend is healthy again.
+func TestWatcher_PreemptScanErrorBacksOff(t *testing.T) {
+	campB := preemptCampaign("campB", "GameB", "dropB", 1000)
+	backend := &preemptTestBackend{
+		campaigns: []platform.Campaign{campB},
+		progress:  map[string]int{"dropB": 0},
+		claimed:   map[string]bool{},
+		channels:  map[string][]platform.Stream{"campB": {{Channel: "streamerB", DropsEnabled: true}}},
+	}
+	w, _, _, _ := startPreemptWatcher(t, backend, "ordered")
+	waitWatchingCampaign(t, w, "campB")
+
+	backend.setCampaignErr(errors.New("transient gql boom"))
+	time.Sleep(300 * time.Millisecond) // several scan rounds fail
+	snap := w.Snapshot()
+	assert.Equal(t, "campB", snap.CampaignID, "scan error must not interrupt the current watch")
+	_, stopped, _ := backend.calls()
+	assert.Empty(t, stopped, "no watch should be stopped on scan error")
+
+	// Backend recovers and a higher-priority campaign appears: the
+	// backoff must not have permanently disabled the scanner.
+	backend.setCampaignErr(nil)
+	campA := preemptCampaign("campA", "GameA", "dropA", 1000)
+	backend.setCampaigns([]platform.Campaign{campB, campA})
+	backend.setChannels(map[string][]platform.Stream{
+		"campB": {{Channel: "streamerB", DropsEnabled: true}},
+		"campA": {{Channel: "streamerA", DropsEnabled: true}},
+	})
+	backend.progress["dropA"] = 0
+	waitWatchingCampaign(t, w, "campA")
+}
+
+// TestWatcher_PreemptPreservesProgress: preemption must not clear the
+// already-credited server-side progress of the old drop and must not
+// trigger a claim for it.
+func TestWatcher_PreemptPreservesProgress(t *testing.T) {
+	campB := preemptCampaign("campB", "GameB", "dropB", 1000)
+	backend := &preemptTestBackend{
+		campaigns: []platform.Campaign{campB},
+		progress:  map[string]int{"dropB": 0},
+		claimed:   map[string]bool{},
+		channels:  map[string][]platform.Stream{"campB": {{Channel: "streamerB", DropsEnabled: true}}},
+	}
+	w, _, _, _ := startPreemptWatcher(t, backend, "ordered")
+	waitWatchingCampaign(t, w, "campB")
+	// Wait for the first heartbeat tick to credit server-side minutes.
+	require.Eventually(t, func() bool { return backend.progressOf("dropB") > 0 },
+		3*time.Second, 5*time.Millisecond, "some watch-time should have accrued before preemption")
+
+	campA := preemptCampaign("campA", "GameA", "dropA", 1000)
+	backend.setCampaigns([]platform.Campaign{campB, campA})
+	backend.setChannels(map[string][]platform.Stream{
+		"campB": {{Channel: "streamerB", DropsEnabled: true}},
+		"campA": {{Channel: "streamerA", DropsEnabled: true}},
+	})
+	backend.progress["dropA"] = 0
+
+	waitWatchingCampaign(t, w, "campA")
+
+	assert.Greater(t, backend.progressOf("dropB"), 0,
+		"preemption must not clear the old drop's credited progress")
+	_, _, claims := backend.calls()
+	assert.Empty(t, claims, "preemption must not trigger a claim for the abandoned drop")
+}
+
+// TestWatcher_NoPreemptInOtherModes: non-ordered pick modes
+// (ending_soonest, low_avbl_first) never preempt, even when a
+// higher-ranked campaign goes live.
+func TestWatcher_NoPreemptInOtherModes(t *testing.T) {
+	for _, mode := range []string{"ending_soonest", "low_avbl_first"} {
+		t.Run(mode, func(t *testing.T) {
+			campB := preemptCampaign("campB", "GameB", "dropB", 1000)
+			backend := &preemptTestBackend{
+				campaigns: []platform.Campaign{campB},
+				progress:  map[string]int{"dropB": 0},
+				claimed:   map[string]bool{},
+				channels:  map[string][]platform.Stream{"campB": {{Channel: "streamerB", DropsEnabled: true}}},
+			}
+			w, _, _, _ := startPreemptWatcher(t, backend, mode)
+			waitWatchingCampaign(t, w, "campB")
+
+			campA := preemptCampaign("campA", "GameA", "dropA", 1000)
+			backend.setCampaigns([]platform.Campaign{campB, campA})
+			backend.setChannels(map[string][]platform.Stream{
+				"campB": {{Channel: "streamerB", DropsEnabled: true}},
+				"campA": {{Channel: "streamerA", DropsEnabled: true}},
+			})
+			backend.progress["dropA"] = 0
+
+			time.Sleep(300 * time.Millisecond)
+			snap := w.Snapshot()
+			assert.Equal(t, "campB", snap.CampaignID, "mode %s must not preempt", mode)
+			_, stopped, _ := backend.calls()
+			assert.Empty(t, stopped, "no watch should be stopped in mode %s", mode)
+		})
+	}
+}
+
+// The top-ranked candidate has no live channel but the next-ranked one
+// does: the scan must walk down the ranking and preempt to the first
+// actually-available higher-priority target (campB), not give up.
+func TestWatcher_PreemptWalksDownToNextAvailable(t *testing.T) {
+	campC := preemptCampaign("campC", "GameC", "dropC", 1000)
+	backend := &preemptTestBackend{
+		campaigns: []platform.Campaign{campC},
+		progress:  map[string]int{"dropC": 0},
+		claimed:   map[string]bool{},
+		channels:  map[string][]platform.Stream{"campC": {{Channel: "streamerC", DropsEnabled: true}}},
+	}
+	w, _, _, _ := startPreemptWatcher(t, backend, "ordered")
+	waitWatchingCampaign(t, w, "campC")
+
+	// campA is the highest-ranked (GameA) but has NO live channels;
+	// campB (GameB) is live and should win the preemption.
+	campA := preemptCampaign("campA", "GameA", "dropA", 1000)
+	campB := preemptCampaign("campB", "GameB", "dropB", 1000)
+	backend.setCampaigns([]platform.Campaign{campC, campA, campB})
+	backend.setChannels(map[string][]platform.Stream{
+		"campC": {{Channel: "streamerC", DropsEnabled: true}},
+		"campB": {{Channel: "streamerB", DropsEnabled: true}},
+	})
+
+	waitWatchingCampaign(t, w, "campB")
+	started, stopped, _ := backend.calls()
+	assert.Contains(t, stopped, "streamerC", "current watch must be stopped before switching")
+	assert.Contains(t, started, "streamerB", "must start watching the live next-ranked candidate")
+}
+
+// A long tail of offline higher-ranked campaigns must not turn every
+// scan into a GQL fan-out: channel probes per scan are capped.
+func TestWatcher_PreemptChannelProbeCap(t *testing.T) {
+	campF := preemptCampaign("campF", "GameC", "dropF", 1000)
+	campaigns := []platform.Campaign{campF}
+	offIDs := []string{"campH0", "campH1", "campH2", "campH3", "campH4"}
+	for i, id := range offIDs {
+		campaigns = append(campaigns, preemptCampaign(id, "GameA", "dropH"+string(rune('0'+i)), 1000))
+	}
+	backend := &preemptTestBackend{
+		campaigns: campaigns,
+		progress:  map[string]int{"dropF": 0},
+		claimed:   map[string]bool{},
+		channels:  map[string][]platform.Stream{"campF": {{Channel: "streamerF", DropsEnabled: true}}},
+	}
+	w := New(Config{
+		AccountID:    "acc-preempt-cap",
+		Session:      platform.Session{},
+		Backend:      backend,
+		GameRank:     preemptRank,
+		PriorityMode: "ordered",
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Seed the watch state the way pickStream leaves it.
+	w.mu.Lock()
+	w.currentCampaign = &campF
+	h := platform.WatchHandle{Channel: "streamerF"}
+	w.handle = &h
+	w.mu.Unlock()
+
+	preempted := w.maybePreempt(ctx)
+	assert.False(t, preempted, "no live higher-ranked channel: must not preempt")
+	assert.LessOrEqual(t, backend.probeCount(offIDs...), maxPreemptChannelProbes,
+		"channel probes per preemption scan must be capped")
+}
+
+// Starvation regression: the first three higher-ranked candidates are
+// persistently offline and the fourth is live. With the per-scan probe
+// cap, a scan that always restarts at the top would never reach the
+// fourth candidate. Round-robin resume must preempt to it within a
+// bounded number of scans.
+func TestWatcher_PreemptRoundRobinNoStarvation(t *testing.T) {
+	campF := preemptCampaign("campF", "GameC", "dropF", 1000)
+	backend := &preemptTestBackend{
+		campaigns: []platform.Campaign{campF},
+		progress:  map[string]int{"dropF": 0},
+		claimed:   map[string]bool{},
+		channels:  map[string][]platform.Stream{"campF": {{Channel: "streamerF", DropsEnabled: true}}},
+	}
+	w, _, _, _ := startPreemptWatcher(t, backend, "ordered")
+	waitWatchingCampaign(t, w, "campF")
+
+	h0 := preemptCampaign("campH0", "GameA", "dropH0", 1000)
+	h1 := preemptCampaign("campH1", "GameA", "dropH1", 1000)
+	h2 := preemptCampaign("campH2", "GameA", "dropH2", 1000)
+	h3 := preemptCampaign("campH3", "GameA", "dropH3", 1000)
+	backend.setCampaigns([]platform.Campaign{campF, h0, h1, h2, h3})
+	backend.setChannels(map[string][]platform.Stream{
+		"campF":  {{Channel: "streamerF", DropsEnabled: true}},
+		"campH3": {{Channel: "streamerH3", DropsEnabled: true}},
+	})
+
+	// Scan 1 probes campH0..campH2 (offline, cursor advances); scan 2
+	// resumes at campH3 (live) and preempts. The pick flow then skips
+	// the channelless H0..H2 and lands on campH3. The 3s waiter is the
+	// bounded-time assertion: without round-robin resume, campH3 would
+	// never be reached.
+	waitWatchingCampaign(t, w, "campH3")
+	started, stopped, _ := backend.calls()
+	assert.Contains(t, stopped, "streamerF", "current watch must be stopped before switching")
+	assert.Contains(t, started, "streamerH3", "must reach the live fourth candidate, not starve below the cap")
+}
+
+// Deterministic cursor check: with five offline higher-ranked
+// candidates and a cap of three, consecutive scans must probe
+// disjoint slices and wrap around, never re-scanning only the top.
+func TestWatcher_PreemptCursorCycles(t *testing.T) {
+	campF := preemptCampaign("campF", "GameC", "dropF", 1000)
+	ids := []string{"campH0", "campH1", "campH2", "campH3", "campH4"}
+	campaigns := []platform.Campaign{campF}
+	for i, id := range ids {
+		campaigns = append(campaigns, preemptCampaign(id, "GameA", "dropH"+string(rune('0'+i)), 1000))
+	}
+	backend := &preemptTestBackend{
+		campaigns: campaigns,
+		progress:  map[string]int{"dropF": 0},
+		claimed:   map[string]bool{},
+		channels:  map[string][]platform.Stream{"campF": {{Channel: "streamerF", DropsEnabled: true}}},
+	}
+	w := New(Config{
+		AccountID:    "acc-preempt-cycle",
+		Session:      platform.Session{},
+		Backend:      backend,
+		GameRank:     preemptRank,
+		PriorityMode: "ordered",
+	})
+	w.mu.Lock()
+	w.currentCampaign = &campF
+	h := platform.WatchHandle{Channel: "streamerF"}
+	w.handle = &h
+	w.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	assert.False(t, w.maybePreempt(ctx))
+	assert.Equal(t, 1, backend.probeCount("campH0"))
+	assert.Equal(t, 1, backend.probeCount("campH1"))
+	assert.Equal(t, 1, backend.probeCount("campH2"))
+	assert.Equal(t, 0, backend.probeCount("campH3", "campH4"), "scan 1 must stop at the cap")
+
+	assert.False(t, w.maybePreempt(ctx))
+	assert.Equal(t, 1, backend.probeCount("campH3"), "scan 2 must resume after the cursor")
+	assert.Equal(t, 1, backend.probeCount("campH4"))
+
+	assert.False(t, w.maybePreempt(ctx))
+	assert.Equal(t, 2, backend.probeCount("campH0"), "scan 3 must wrap to the top after a full cycle")
+}
