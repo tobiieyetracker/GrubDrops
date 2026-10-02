@@ -335,6 +335,9 @@ func run() error {
 	// Backend.Claim. Without it InsertClaim has no production caller
 	// and the /drops Past + /history views stay empty.
 	claimRecorder := store.NewClaimRecorder(q)
+	// ProgressRecorder persists inventory progress from the watcher itself;
+	// it does not depend on a dashboard request to keep the progress table fresh.
+	progressRecorder := store.NewProgressRecorder(q)
 
 	// Per-account direct-Twitch backends. The direct twitch.Backend holds
 	// per-account state (auth, userID/userLogin caches, its own PubSub
@@ -473,17 +476,18 @@ func run() error {
 			HeartbeatInterval:     60 * time.Second,
 			ProgressNotifyStepPct: progressStep,
 			AllowGame:             allow, GameRank: rank,
-			Games:          names,
-			AllowChannel:   allowChannel,
-			PriorityMode:   priorityMode,
-			Persister:      campaignPersister,
-			ClaimRecorder:  claimRecorder,
-			ForceLinked:    forceLinked,
-			ForceCollected: forceCollected,
-			PersistedSkips: persistedSkips,
-			SkipRecorder:   skipRecorder,
-			SkipClearer:    skipClearer,
-			ForceWatcher:   forceWatchStore{q: q},
+			Games:            names,
+			AllowChannel:     allowChannel,
+			PriorityMode:     priorityMode,
+			Persister:        campaignPersister,
+			ClaimRecorder:    claimRecorder,
+			ProgressRecorder: progressRecorder,
+			ForceLinked:      forceLinked,
+			ForceCollected:   forceCollected,
+			PersistedSkips:   persistedSkips,
+			SkipRecorder:     skipRecorder,
+			SkipClearer:      skipClearer,
+			ForceWatcher:     forceWatchStore{q: q},
 		})
 		return scheduler.NewEntry(a.ID, w), nil
 	}

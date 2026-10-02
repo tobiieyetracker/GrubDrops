@@ -227,7 +227,7 @@ const upsertProgress = `-- name: UpsertProgress :exec
 INSERT INTO progress (account_id, benefit_id, minutes_watched, claimed_at, updated_at)
 VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(account_id, benefit_id) DO UPDATE SET
-    minutes_watched = excluded.minutes_watched,
+    minutes_watched = MAX(progress.minutes_watched, excluded.minutes_watched),
     claimed_at = COALESCE(excluded.claimed_at, progress.claimed_at),
     updated_at = excluded.updated_at
 `

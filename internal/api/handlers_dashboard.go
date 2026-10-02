@@ -268,13 +268,11 @@ func (d dashboardDeps) collectPage(r *http.Request) dashPage {
 		snapByID[s.AccountID] = s
 	}
 
-	// Persist watch progress so the lifetime "Watch time" tile
-	// (SumWatchMinutes over the progress table) has a durable source.
-	// The scheduler holds no store handle, so the dashboard poll is the
-	// seam that has both live snapshots and the queries. Minutes only
-	// grow, so overwriting with the current value is correct. Best-effort:
-	// benefits that were never persisted (synth/scrape drops) fail the FK
-	// and are skipped silently.
+	// Watchers persist inventory progress directly. This dashboard-side sync
+	// also captures a newer PubSub progress snapshot before the next inventory
+	// poll, keeping the lifetime "Watch time" tile current. Best-effort:
+	// benefits that were never persisted (synth/scrape drops) fail the FK and
+	// are skipped silently.
 	persistedAt := time.Now().Unix()
 	for _, s := range snapshots {
 		if s.BenefitID == "" || s.MinutesWatched <= 0 {

@@ -6,6 +6,12 @@ All notable changes to GrubDrops.
 
 ### Added
 
+- **Watcher-owned progress persistence and an authenticated status endpoint.**
+  Every successful inventory poll now persists all known timed-drop progress
+  rows, including observed zero-minute rows, without relying on dashboard
+  traffic. `GET /api/status` returns local watcher state, current drop progress,
+  and last poll/heartbeat/progress timestamps; `/healthz` remains a liveness
+  check only.
 - **Dynamic priority preemption in `ordered` mode.** While watching, the
   watcher now re-scans eligible campaigns every ~2 minutes. If a
   strictly higher-ranked whitelisted game has an eligible campaign with a

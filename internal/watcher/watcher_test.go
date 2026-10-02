@@ -85,6 +85,93 @@ func (r *recordingNotifier) has(ev string) bool {
 	return false
 }
 
+type recordedProgress struct {
+	accountID string
+	benefitID string
+	minutes   int
+}
+
+type recordingProgressRecorder struct {
+	mu   sync.Mutex
+	rows []recordedProgress
+}
+
+func (r *recordingProgressRecorder) RecordProgress(_ context.Context, accountID, benefitID string, minutes int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rows = append(r.rows, recordedProgress{accountID: accountID, benefitID: benefitID, minutes: minutes})
+	return nil
+}
+
+func (r *recordingProgressRecorder) snapshot() []recordedProgress {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]recordedProgress(nil), r.rows...)
+}
+
+type inventoryProgressBackend struct {
+	*platformtest.MockBackend
+	rows []platform.Progress
+}
+
+func (b *inventoryProgressBackend) InventoryProgress(_ context.Context, _ platform.Session) ([]platform.Progress, error) {
+	return append([]platform.Progress(nil), b.rows...), nil
+}
+
+func TestWatcher_PersistsAllKnownInventoryProgressWithoutDashboard(t *testing.T) {
+	ctx := context.Background()
+	campaign := platform.Campaign{
+		ID: "camp-1", Game: "Rust", Name: "Rust event", Status: "active",
+		Benefits: []platform.DropBenefit{
+			{ID: "drop-current", CampaignID: "camp-1", Name: "Current", RequiredMinutes: 60},
+			{ID: "drop-sibling", CampaignID: "camp-1", Name: "Sibling", RequiredMinutes: 120},
+		},
+	}
+	backend := &inventoryProgressBackend{
+		MockBackend: platformtest.New(),
+		rows: []platform.Progress{
+			{BenefitID: "drop-current", MinutesWatched: 4},
+			{BenefitID: "drop-sibling", MinutesWatched: 21},
+			// Owned-reward markers aren't timed-drop benefit IDs and must not
+			// be sent to the progress table (which has a benefits FK).
+			{BenefitID: "reward-marker", MinutesWatched: 60, Claimed: true},
+		},
+	}
+	recorder := &recordingProgressRecorder{}
+	session := platform.Session{AccessToken: "tok"}
+	stream := platform.Stream{Channel: "rust-stream", DropsEnabled: true}
+	handle, err := backend.StartWatch(ctx, session, stream)
+	require.NoError(t, err)
+	w := New(Config{
+		AccountID:         "acc-progress",
+		Backend:           backend,
+		Session:           session,
+		TickInterval:      time.Second,
+		HeartbeatInterval: time.Second,
+		PriorityMode:      "ending_soonest",
+		ProgressRecorder:  recorder,
+	})
+	w.mu.Lock()
+	w.currentCampaign = &campaign
+	w.currentBenefit = &campaign.Benefits[0]
+	w.currentStream = &stream
+	w.handle = &handle
+	w.lastDiscovery = []platform.Campaign{campaign}
+	w.mu.Unlock()
+
+	require.NoError(t, w.tickWatch(ctx))
+	assert.ElementsMatch(t, []recordedProgress{
+		{accountID: "acc-progress", benefitID: "drop-current", minutes: 4},
+		{accountID: "acc-progress", benefitID: "drop-sibling", minutes: 21},
+	}, recorder.snapshot(), "inventory progress should be persisted without a dashboard request")
+
+	snapshot := w.Snapshot()
+	assert.Equal(t, 4, snapshot.MinutesWatched)
+	assert.False(t, snapshot.LastHeartbeatAt.IsZero())
+	assert.False(t, snapshot.LastProgressAt.IsZero())
+	assert.False(t, snapshot.LastPollAt.IsZero())
+}
+
 func TestWatcher_MinesUntilClaim(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

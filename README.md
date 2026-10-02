@@ -383,9 +383,11 @@ Released under the [MIT License](LICENSE).
 
 ## A note on responsible use
 
-Self-hosted, single-tenant. `/healthz` for liveness; keep `/data` across
-redeploys; reverse-proxy it if exposed. Stay within each platform's ToS, on your
-own accounts, at your own risk.
+Self-hosted, single-tenant. `/healthz` reports process liveness; authenticated
+`GET /api/status` returns read-only watcher snapshots with current drop progress
+and recent heartbeat/poll timestamps. Keep `/data` across redeploys;
+reverse-proxy the app only through an approved private access path. Stay within
+each platform's ToS, on your own accounts, at your own risk.
 
 ---
 

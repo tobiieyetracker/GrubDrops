@@ -34,6 +34,12 @@ type ClaimRecorder interface {
 	RecordClaim(ctx context.Context, accountID string, benefit platform.DropBenefit) error
 }
 
+// ProgressRecorder persists observed inventory progress so it survives a
+// watcher restart and does not depend on the dashboard being polled.
+type ProgressRecorder interface {
+	RecordProgress(ctx context.Context, accountID, benefitID string, minutes int) error
+}
+
 type Config struct {
 	AccountID    string
 	AccountLabel string // human handle (@login) for notifications; falls back to AccountID
@@ -111,6 +117,10 @@ type Config struct {
 	// /history view stay empty.
 	ClaimRecorder ClaimRecorder
 
+	// ProgressRecorder persists all known benefits returned by an inventory
+	// progress poll. It is best-effort and never blocks watch/claim decisions.
+	ProgressRecorder ProgressRecorder
+
 	// ForceLinked, when set and returning true for a campaign id, treats
 	// that campaign as account-linked even if the backend reports it
 	// unlinked. Backs the manual "I've linked it" override on /drops:
@@ -187,6 +197,8 @@ type Watcher struct {
 	handle          *platform.WatchHandle
 	watchStartedAt  time.Time
 	lastPollAt      time.Time // last inventory/progress poll (for the "last poll" UI)
+	lastHeartbeatAt time.Time // last successful watch heartbeat
+	lastProgressAt  time.Time // last time observed minutes advanced for the current benefit
 	lastProgressMin int
 	// lastNotifiedMilestone is the highest progress milestone-% already sent in
 	// a "progress" Discord notification (multiple of ProgressNotifyStepPct, or
@@ -358,6 +370,7 @@ func (w *Watcher) handlePubSubDropProgress(dropID string, curMin, _ int64) {
 	// the freeze counter alongside the vanish counter.
 	if int(curMin) > w.lastProgressMin {
 		w.noAdvanceTicks = 0
+		w.lastProgressAt = time.Now()
 	}
 	w.lastProgressMin = int(curMin)
 	w.noProgressTicks = 0
@@ -621,6 +634,8 @@ type Snapshot struct {
 	ViewerCount     int
 	StartedAt       time.Time
 	LastPollAt      time.Time
+	LastHeartbeatAt time.Time
+	LastProgressAt  time.Time
 }
 
 func (w *Watcher) Snapshot() Snapshot {
@@ -648,7 +663,71 @@ func (w *Watcher) Snapshot() Snapshot {
 	s.MinutesWatched = w.lastProgressMin
 	s.StartedAt = w.watchStartedAt
 	s.LastPollAt = w.lastPollAt
+	s.LastHeartbeatAt = w.lastHeartbeatAt
+	s.LastProgressAt = w.lastProgressAt
 	return s
+}
+
+func (w *Watcher) markHeartbeat() {
+	w.mu.Lock()
+	w.lastHeartbeatAt = time.Now()
+	w.mu.Unlock()
+}
+
+// persistInventoryProgress stores all known watch-time benefits in the
+// inventory response, not just currentBenefit. The known-ID check excludes
+// gameEventDrops reward IDs, which are ownership markers rather than timed
+// drop IDs and have no row in the benefits table.
+func (w *Watcher) persistInventoryProgress(ctx context.Context, progress []platform.Progress) {
+	recorder := w.cfg.ProgressRecorder
+	if recorder == nil || len(progress) == 0 {
+		return
+	}
+
+	w.mu.Lock()
+	known := make(map[string]struct{})
+	for _, campaign := range w.lastDiscovery {
+		for _, benefit := range campaign.Benefits {
+			if benefit.ID != "" {
+				known[benefit.ID] = struct{}{}
+			}
+		}
+	}
+	if w.currentCampaign != nil {
+		for _, benefit := range w.currentCampaign.Benefits {
+			if benefit.ID != "" {
+				known[benefit.ID] = struct{}{}
+			}
+		}
+	}
+	if w.currentBenefit != nil && w.currentBenefit.ID != "" {
+		known[w.currentBenefit.ID] = struct{}{}
+	}
+	w.mu.Unlock()
+
+	failed := 0
+	firstFailedBenefit := ""
+	var firstErr error
+	for _, p := range progress {
+		if p.BenefitID == "" || p.MinutesWatched < 0 {
+			continue
+		}
+		if _, ok := known[p.BenefitID]; !ok {
+			continue
+		}
+		if err := recorder.RecordProgress(ctx, w.cfg.AccountID, p.BenefitID, p.MinutesWatched); err != nil {
+			failed++
+			if firstErr == nil {
+				firstFailedBenefit = p.BenefitID
+				firstErr = err
+			}
+		}
+	}
+	if failed > 0 {
+		slog.Warn("watcher persist progress failed", "kind", "error",
+			"account", w.cfg.AccountID, "failed_count", failed,
+			"first_benefit", firstFailedBenefit, "err", firstErr)
+	}
 }
 
 // notifyFields builds the field map for a claim/progress notification.
@@ -1002,6 +1081,8 @@ func (w *Watcher) forceWatch(ctx context.Context) error {
 			return fmt.Errorf("force watch heartbeat: %w", err)
 		}
 		slog.Warn("force-watch heartbeat error", "kind", "error", "account", w.cfg.AccountID, "err", err)
+	} else {
+		w.markHeartbeat()
 	}
 
 	// Periodically yield back to mining so a newly-live whitelisted drop
@@ -1246,6 +1327,7 @@ func (w *Watcher) pickCampaign(ctx context.Context) error {
 	w.lastDiscovery = cached
 	w.lastDiscoveryAt = time.Now()
 	w.mu.Unlock()
+	w.persistInventoryProgress(ctx, progress)
 
 	// For mining, keep only ACTIVE + ACCOUNT-LINKED campaigns. Sort by
 	// whitelist rank (lower = higher priority). Empty Status is treated
@@ -1643,6 +1725,7 @@ func (w *Watcher) pickStream(ctx context.Context) error {
 	w.handle = &h
 	w.watchStartedAt = time.Now()
 	w.lastProgressMin = 0
+	w.lastProgressAt = time.Time{}
 	if w.currentBenefit == nil || w.currentBenefit.ID != w.milestoneBenefit {
 		w.lastNotifiedMilestone = -1
 		w.milestoneBenefit = ""
@@ -1868,6 +1951,7 @@ func (w *Watcher) maybePreempt(ctx context.Context) bool {
 	w.noAdvanceTicks = 0
 	w.noProgressTicks = 0
 	w.lastProgressMin = 0
+	w.lastProgressAt = time.Time{}
 	w.mu.Unlock()
 	w.setState(ctx, StatePickCampaign)
 	return true
@@ -1966,6 +2050,7 @@ func (w *Watcher) tickWatch(ctx context.Context) error {
 			slog.Error("watcher heartbeat failed", "kind", "error", "account", w.cfg.AccountID, "channel", handle.Channel, "err", err)
 			return fmt.Errorf("heartbeat: %w", err)
 		}
+		w.markHeartbeat()
 		// kind=heartbeat feeds the dashboard HEARTBEATS/HR card via the
 		// log ring (counted over the last hour).
 		slog.Info("watcher heartbeat sent", "kind", "heartbeat", "account", w.cfg.AccountID, "channel", handle.Channel)
@@ -2034,6 +2119,7 @@ func (w *Watcher) tickWatch(ctx context.Context) error {
 		slog.Error("watcher inventory failed", "kind", "error", "account", w.cfg.AccountID, "err", err)
 		return fmt.Errorf("inventory: %w", err)
 	}
+	w.persistInventoryProgress(ctx, progress)
 	// Multi-reward sweep (Kick): one watch session advances many rewards at
 	// once, but the loop below only acts on currentBenefit. Claim every
 	// reward that has independently hit 100% so sibling rewards (the open
@@ -2072,6 +2158,7 @@ func (w *Watcher) tickWatch(ctx context.Context) error {
 			// reset it the moment minutes advance.
 			if p.MinutesWatched > w.lastProgressMin {
 				w.noAdvanceTicks = 0
+				w.lastProgressAt = time.Now()
 			} else {
 				w.noAdvanceTicks++
 			}

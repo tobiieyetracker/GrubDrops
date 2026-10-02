@@ -178,6 +178,10 @@ func NewRouter(d Deps) http.Handler {
 		channelCounters: channelCountersFromRegistry(d.Registry),
 		kickPath:        d.KickActivePath,
 	}
+	statusH := statusDeps{startedAt: startedAt}
+	if d.Scheduler != nil {
+		statusH.snapshots = d.Scheduler.WatcherSnapshots
+	}
 	accs := accountsDeps{q: d.Q, db: d.DB, t: d.Templates, sm: d.Session, sch: d.Scheduler, reload: d.Reload, authCheck: d.AuthCheck, reloadAccount: d.ReloadAccount, rootCtx: d.RootCtx, loc: d.Zone}
 	loginTwitch := newLoginTwitchDeps(d, d.RootCtx)
 	loginTwitchCookie := newLoginTwitchCookieDeps(d, d.RootCtx)
@@ -238,6 +242,7 @@ func NewRouter(d Deps) http.Handler {
 	authed.Get("/dashboard/cards", dash.cards)
 	authed.Get("/dashboard/telemetry", dash.telemetry)
 	authed.Get("/dashboard/events", dash.events)
+	authed.Get("/api/status", statusH.get)
 	authed.Get("/dashboard/campaign/{id}", dash.campaignDetail)
 	authed.Get("/dashboard/account/{id}", dash.accountDetail)
 	authed.Get("/accounts", accs.list)
