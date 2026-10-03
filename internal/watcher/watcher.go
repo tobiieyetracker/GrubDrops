@@ -1214,16 +1214,6 @@ func (w *Watcher) pickCampaign(ctx context.Context) error {
 		}
 		if pr := w.cfg.ProgressRecorder; pr != nil {
 			if dbProgress, err := pr.UnclaimedProgress(ctx, w.cfg.AccountID); err == nil {
-				// Build set of active campaign benefit IDs for the
-				// "campaign still active" check.
-				activeBenefits := make(map[string]bool)
-				for _, c := range campaigns {
-					for _, b := range c.Benefits {
-						if b.ID != "" {
-							activeBenefits[b.ID] = true
-						}
-					}
-				}
 				for benefitID, minutes := range dbProgress {
 					if minutes <= 0 {
 						continue
@@ -1234,11 +1224,9 @@ func (w *Watcher) pickCampaign(ctx context.Context) error {
 					if claimed[benefitID] {
 						continue // already marked
 					}
-					if !activeBenefits[benefitID] {
-						continue // campaign ended/expired, not our concern
-					}
-					// Vanished from in-progress but campaign active and had
-					// progress: treat as externally claimed.
+					// Vanished from in-progress inventory: Twitch removes
+					// claimed drops from dropCampaignsInProgress entirely.
+					// Treat as externally claimed.
 					slog.Info("watcher benefit vanished from inventory; marking as externally claimed",
 						"kind", "state", "account", w.cfg.AccountID,
 						"benefit", benefitID, "last_minutes", minutes)
