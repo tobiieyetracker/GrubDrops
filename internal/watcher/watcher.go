@@ -1154,6 +1154,21 @@ func (w *Watcher) pickCampaign(ctx context.Context) error {
 			inventoryOK = true
 		}
 	}
+	// Vanish detection needs inventory even when discovery returned no
+	// campaigns (e.g. force-watch idle loop). Fetch independently if not
+	// already fetched above.
+	var vanishProgress []platform.Progress
+	vanishOK := inventoryOK
+	if !inventoryOK {
+		if vp, verr := w.cfg.Backend.InventoryProgress(ctx, w.cfg.Session); verr == nil {
+			vanishProgress = vp
+			vanishOK = true
+		} else {
+			slog.Debug("watcher vanish-check inventory failed", "kind", "error", "account", w.cfg.AccountID, "err", verr)
+		}
+	} else {
+		vanishProgress = progress
+	}
 	// ownClaimed = benefit ids this account already has a claim row for.
 	// Twitch drops a claimed drop from dropCampaignsInProgress once the
 	// campaign completes, so its per-drop IsClaimed is no longer visible and
@@ -1190,9 +1205,13 @@ func (w *Watcher) pickCampaign(ctx context.Context) error {
 	// the current tracked set, and its campaign is still active, it was
 	// almost certainly claimed outside GrubDrops (e.g. via Twitch's UI).
 	// Mark it claimed in the DB so the pick loop skips it instead of
-	// re-mining a done drop. Gated on inventoryOK so a failed fetch
-	// (empty progress) can never wrongly mark everything claimed.
-	if inventoryOK {
+	// re-mining a done drop. Uses vanishProgress/vanishOK (fetched
+	// independently) so it runs even when discovery returned no campaigns.
+	if vanishOK {
+		vanishTracked := make(map[string]bool, len(vanishProgress))
+		for _, p := range vanishProgress {
+			vanishTracked[p.BenefitID] = true
+		}
 		if pr := w.cfg.ProgressRecorder; pr != nil {
 			if dbProgress, err := pr.UnclaimedProgress(ctx, w.cfg.AccountID); err == nil {
 				// Build set of active campaign benefit IDs for the
@@ -1209,7 +1228,7 @@ func (w *Watcher) pickCampaign(ctx context.Context) error {
 					if minutes <= 0 {
 						continue
 					}
-					if tracked[benefitID] {
+					if vanishTracked[benefitID] {
 						continue // still in progress, not vanished
 					}
 					if claimed[benefitID] {
