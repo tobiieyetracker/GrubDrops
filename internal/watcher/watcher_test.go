@@ -1325,13 +1325,14 @@ func TestWatcher_ForceWatchesWhenIdle(t *testing.T) {
 
 	backend := &idleBackend{platformtest.New()}
 	w := New(Config{
-		AccountID:    "acc1",
-		Backend:      backend,
-		Session:      platform.Session{AccessToken: "tok"},
-		Notifier:     &recordingNotifier{},
-		TickInterval: 5 * time.Millisecond,
-		AllowGame:    func(string) bool { return false }, // nothing mineable
-		ForceWatcher: fakeForce{channel: "xqc"},
+		AccountID:         "acc1",
+		Backend:           backend,
+		Session:           platform.Session{AccessToken: "tok"},
+		Notifier:          &recordingNotifier{},
+		TickInterval:      5 * time.Millisecond,
+		HeartbeatInterval: 5 * time.Millisecond, // heartbeat every tick for test speed
+		AllowGame:         func(string) bool { return false }, // nothing mineable
+		ForceWatcher:      fakeForce{channel: "xqc"},
 	})
 	_ = w.Run(ctx)
 	assert.Greater(t, backend.Heartbeats(), int64(0),

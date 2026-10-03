@@ -1075,14 +1075,23 @@ func (w *Watcher) forceWatch(ctx context.Context) error {
 		return nil
 	}
 
-	// Subsequent ticks: keep the watch alive.
-	if err := w.cfg.Backend.Heartbeat(ctx, *handle); err != nil {
-		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
-			return fmt.Errorf("force watch heartbeat: %w", err)
+	// Subsequent ticks: keep the watch alive. Throttle the Spade beacon
+	// to heartbeatEveryTicks (default: 1/min) — Twitch credits exactly 1
+	// minute per beacon, so sending on every 5s tick is 12x redundant
+	// traffic. Mirrors the tickWatch gating.
+	w.mu.Lock()
+	w.tickCount++
+	tickN := w.tickCount
+	w.mu.Unlock()
+	if tickN%w.heartbeatEveryTicks() == 0 {
+		if err := w.cfg.Backend.Heartbeat(ctx, *handle); err != nil {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				return fmt.Errorf("force watch heartbeat: %w", err)
+			}
+			slog.Warn("force-watch heartbeat error", "kind", "error", "account", w.cfg.AccountID, "err", err)
+		} else {
+			w.markHeartbeat()
 		}
-		slog.Warn("force-watch heartbeat error", "kind", "error", "account", w.cfg.AccountID, "err", err)
-	} else {
-		w.markHeartbeat()
 	}
 
 	// Periodically yield back to mining so a newly-live whitelisted drop
