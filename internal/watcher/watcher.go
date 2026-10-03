@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aalejandrofer/grubdrops/internal/platform"
+	"github.com/aalejandrofer/grubdrops/internal/store"
 )
 
 type Notifier interface {
@@ -1177,6 +1178,56 @@ func (w *Watcher) pickCampaign(ctx context.Context) error {
 		tracked[p.BenefitID] = true
 		if p.Claimed {
 			claimed[p.BenefitID] = true
+		}
+	}
+
+	// Detect externally-claimed drops. Twitch removes a claimed drop from
+	// dropCampaignsInProgress entirely, so it vanishes from the inventory
+	// response. If the DB shows progress > 0 for a benefit that is NOT in
+	// the current tracked set, and its campaign is still active, it was
+	// almost certainly claimed outside GrubDrops (e.g. via Twitch's UI).
+	// Mark it claimed in the DB so the pick loop skips it instead of
+	// re-mining a done drop. Gated on inventoryOK so a failed fetch
+	// (empty progress) can never wrongly mark everything claimed.
+	if inventoryOK {
+		if pr, ok := w.cfg.ProgressRecorder.(*store.ProgressRecorder); ok && pr != nil {
+			if dbProgress, err := pr.UnclaimedProgress(ctx, w.cfg.AccountID); err == nil {
+				// Build set of active campaign benefit IDs for the
+				// "campaign still active" check.
+				activeBenefits := make(map[string]bool)
+				for _, c := range campaigns {
+					for _, b := range c.Benefits {
+						if b.ID != "" {
+							activeBenefits[b.ID] = true
+						}
+					}
+				}
+				for benefitID, minutes := range dbProgress {
+					if minutes <= 0 {
+						continue
+					}
+					if tracked[benefitID] {
+						continue // still in progress, not vanished
+					}
+					if claimed[benefitID] {
+						continue // already marked
+					}
+					if !activeBenefits[benefitID] {
+						continue // campaign ended/expired, not our concern
+					}
+					// Vanished from in-progress but campaign active and had
+					// progress: treat as externally claimed.
+					slog.Info("watcher benefit vanished from inventory; marking as externally claimed",
+						"kind", "state", "account", w.cfg.AccountID,
+						"benefit", benefitID, "last_minutes", minutes)
+					if err := pr.MarkClaimed(ctx, w.cfg.AccountID, benefitID); err != nil {
+						slog.Warn("watcher mark claimed failed", "kind", "error",
+							"account", w.cfg.AccountID, "benefit", benefitID, "err", err)
+					} else {
+						claimed[benefitID] = true
+					}
+				}
+			}
 		}
 	}
 
