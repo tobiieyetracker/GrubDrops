@@ -103,6 +103,14 @@ func (r *recordingProgressRecorder) RecordProgress(_ context.Context, accountID,
 	return nil
 }
 
+func (r *recordingProgressRecorder) MarkClaimed(_ context.Context, _, _ string) error {
+	return nil
+}
+
+func (r *recordingProgressRecorder) UnclaimedProgress(_ context.Context, _ string) (map[string]int64, error) {
+	return map[string]int64{}, nil
+}
+
 func (r *recordingProgressRecorder) snapshot() []recordedProgress {
 	r.mu.Lock()
 	defer r.mu.Unlock()

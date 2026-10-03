@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/aalejandrofer/grubdrops/internal/platform"
-	"github.com/aalejandrofer/grubdrops/internal/store"
 )
 
 type Notifier interface {
@@ -39,6 +38,10 @@ type ClaimRecorder interface {
 // watcher restart and does not depend on the dashboard being polled.
 type ProgressRecorder interface {
 	RecordProgress(ctx context.Context, accountID, benefitID string, minutes int) error
+	// MarkClaimed records an externally-claimed benefit (e.g. via Twitch UI).
+	MarkClaimed(ctx context.Context, accountID, benefitID string) error
+	// UnclaimedProgress returns benefitID -> minutes for unclaimed rows.
+	UnclaimedProgress(ctx context.Context, accountID string) (map[string]int64, error)
 }
 
 type Config struct {
@@ -1190,7 +1193,7 @@ func (w *Watcher) pickCampaign(ctx context.Context) error {
 	// re-mining a done drop. Gated on inventoryOK so a failed fetch
 	// (empty progress) can never wrongly mark everything claimed.
 	if inventoryOK {
-		if pr, ok := w.cfg.ProgressRecorder.(*store.ProgressRecorder); ok && pr != nil {
+		if pr := w.cfg.ProgressRecorder; pr != nil {
 			if dbProgress, err := pr.UnclaimedProgress(ctx, w.cfg.AccountID); err == nil {
 				// Build set of active campaign benefit IDs for the
 				// "campaign still active" check.
