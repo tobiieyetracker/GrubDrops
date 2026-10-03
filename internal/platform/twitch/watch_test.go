@@ -127,6 +127,33 @@ func TestWatch_HeartbeatPostsSpadeBeacon(t *testing.T) {
 		"heartbeat must NOT use the gzip/twilight envelope")
 }
 
+// streamMetaGQLHandler returns an httptest handler for "/" that answers
+// OpGetStreamInfo with a live stream for the given channel. Used by tests
+// where start() must resolve stream metadata from a bare channel login.
+func streamMetaGQLHandler(channel, channelID, broadcastID, game, gameID string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"data": map[string]any{
+				"user": map[string]any{
+					"id":    channelID,
+					"login": channel,
+					"broadcastSettings": map[string]any{
+						"title": "test",
+						"game":  map[string]any{"id": gameID, "displayName": game},
+					},
+					"stream": map[string]any{
+						"id":           broadcastID,
+						"viewersCount": 10,
+						"game":         map[string]any{"id": gameID, "displayName": game},
+					},
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}
+}
+
 // TestWatch_HeartbeatRetriesAfterFailedBeacon verifies the cache-evict
 // + re-resolve + retry path: a first beacon failure triggers a fresh
 // resolveSpadeURL, and the second beacon attempt succeeds.
@@ -154,6 +181,8 @@ func TestWatch_HeartbeatRetriesAfterFailedBeacon(t *testing.T) {
 		beaconHits++
 		w.WriteHeader(http.StatusNoContent)
 	})
+	// GQL: start() resolves stream metadata for the bare channel login.
+	mux.HandleFunc("/", streamMetaGQLHandler(channel, "c1", "b1", "Test Game", "g1"))
 	srv = httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -186,6 +215,8 @@ func TestWatch_HeartbeatFailsOnNon204(t *testing.T) {
 	mux.HandleFunc("/spade", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 	})
+	// GQL: start() resolves stream metadata for the bare channel login.
+	mux.HandleFunc("/", streamMetaGQLHandler(channel, "c9", "b9", "Test Game", "g9"))
 	srv = httptest.NewServer(mux)
 	defer srv.Close()
 

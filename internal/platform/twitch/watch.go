@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"sync"
 	"time"
@@ -57,6 +58,21 @@ func (w *watch) start(ctx context.Context, sess platform.Session, stream platfor
 	if err != nil {
 		return platform.WatchHandle{}, fmt.Errorf("resolve user id: %w", err)
 	}
+	// Force-watch (and any other caller) may hand us a bare channel login
+	// with no stream metadata. The Spade minute-watched beacon requires
+	// channel_id/broadcast_id/game_id — Twitch silently discards
+	// heartbeats missing them (HTTP 204 anyway, minutes never accrue).
+	// Resolve the live stream metadata before building the handle.
+	if stream.ChannelID == "" || stream.BroadcastID == "" || stream.GameID == "" {
+		resolved, err := w.resolveStreamMeta(ctx, sess, stream.Channel)
+		if err != nil {
+			return platform.WatchHandle{}, fmt.Errorf("resolve stream meta for %s: %w", stream.Channel, err)
+		}
+		stream = resolved
+		slog.Info("watch stream metadata resolved", "kind", "watch",
+			"channel", stream.Channel, "channel_id", stream.ChannelID,
+			"broadcast_id", stream.BroadcastID, "game", stream.Game, "game_id", stream.GameID)
+	}
 	return platform.WatchHandle{
 		Channel: stream.Channel,
 		Internal: watchInternal{
@@ -68,6 +84,35 @@ func (w *watch) start(ctx context.Context, sess platform.Session, stream platfor
 			UserID:      userID,
 			Token:       sess.AccessToken,
 		},
+	}, nil
+}
+
+// resolveStreamMeta fetches live stream metadata (channel_id,
+// broadcast_id, game_id, game) for a channel login via OpGetStreamInfo.
+// Used when StartWatch receives a bare channel name (e.g. force-watch).
+func (w *watch) resolveStreamMeta(ctx context.Context, sess platform.Session, channel string) (platform.Stream, error) {
+	var sd streamLiveData
+	if err := w.c.gql(ctx, sess.AccessToken, OpGetStreamInfo,
+		map[string]any{"channel": channel}, &sd); err != nil {
+		return platform.Stream{}, fmt.Errorf("stream info %s: %w", channel, err)
+	}
+	if sd.User.Stream == nil {
+		return platform.Stream{}, fmt.Errorf("channel %s is not live", channel)
+	}
+	gameID, gameName := "", ""
+	if sd.User.Stream.Game != nil {
+		gameID, gameName = sd.User.Stream.Game.ID, sd.User.Stream.Game.DisplayName
+	} else if sd.User.BroadcastSettings.Game != nil {
+		gameID, gameName = sd.User.BroadcastSettings.Game.ID, sd.User.BroadcastSettings.Game.DisplayName
+	}
+	return platform.Stream{
+		Channel:      sd.User.Login,
+		ViewerCount:  sd.User.Stream.ViewersCount,
+		DropsEnabled: true,
+		ChannelID:    sd.User.ID,
+		BroadcastID:  sd.User.Stream.ID,
+		GameID:       gameID,
+		Game:         gameName,
 	}, nil
 }
 
@@ -125,6 +170,8 @@ func (w *watch) heartbeat(ctx context.Context, h platform.WatchHandle) error {
 	}
 
 	if err := w.c.sendSpadeBeacon(ctx, internal.Token, spadeURL, events); err == nil {
+		slog.Info("spade heartbeat sent", "kind", "watch",
+			"channel", internal.Channel, "game", internal.Game, "game_id", internal.GameID)
 		return nil
 	}
 
