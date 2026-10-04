@@ -36,18 +36,24 @@ func (r *ClaimRecorder) RecordClaim(ctx context.Context, accountID string, b pla
 // code in value_meta_json so the /drops + /history surfaces can show
 // it. Used by the F9 onsite-notification path (Minecraft codes etc).
 // Empty code degrades to the same blob the bare-claim flow writes.
+//
+// The recorded claim represents the TWITCH-SIDE inventory claim only.
+// Game-side delivery/redemption is a separate state and must not be
+// conflated: a Twitch claim row never implies in-game receipt.
 func (r *ClaimRecorder) RecordClaimWithCode(ctx context.Context, accountID string, b platform.DropBenefit, code string) error {
 	if r == nil || r.Q == nil {
 		return nil
 	}
-	meta := "{}"
-	if code != "" {
-		raw, _ := json.Marshal(struct {
-			Code        string `json:"code"`
-			BenefitName string `json:"benefit_name,omitempty"`
-		}{Code: code, BenefitName: b.Name})
-		meta = string(raw)
-	}
+	raw, _ := json.Marshal(struct {
+		Source      string `json:"source"`
+		Code        string `json:"code,omitempty"`
+		BenefitName string `json:"benefit_name,omitempty"`
+	}{
+		Source:      "twitch_inventory",
+		Code:        code,
+		BenefitName: b.Name,
+	})
+	meta := string(raw)
 	return r.Q.InsertClaim(ctx, gen.InsertClaimParams{
 		ID:            NewClaimID(),
 		AccountID:     accountID,

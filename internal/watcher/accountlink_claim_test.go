@@ -159,3 +159,43 @@ func TestClaimChallengeErrorStopsNoRetry(t *testing.T) {
 	// If we get here without hanging or panicking, the error path
 	// stopped cleanly instead of spinning.
 }
+
+// TestClaim429ErrorStopsNoRetry verifies that HTTP 429 rate-limit errors
+// from the claim path do not trigger tight-loop retries.
+func TestClaim429ErrorStopsNoRetry(t *testing.T) {
+	backend := newAccountLinkBackend()
+	backend.claimErr = errors.New("twitch gql: HTTP 429 Too Many Requests")
+	w := newAccountLinkWatcher(backend)
+
+	backend.advance("drop1", 2)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- w.Run(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+	assert.Equal(t, 0, backend.claimCount(), "429-failed claim must not be counted as claimed")
+	cancel()
+	<-done
+}
+
+// TestClaimAuthErrorStopsNoRetry verifies that authentication errors
+// from the claim path do not trigger tight-loop retries.
+func TestClaimAuthErrorStopsNoRetry(t *testing.T) {
+	backend := newAccountLinkBackend()
+	backend.claimErr = errors.New("twitch gql: HTTP 401 Unauthorized: invalid access token")
+	w := newAccountLinkWatcher(backend)
+
+	backend.advance("drop1", 2)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- w.Run(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+	assert.Equal(t, 0, backend.claimCount(), "auth-failed claim must not be counted as claimed")
+	cancel()
+	<-done
+}
