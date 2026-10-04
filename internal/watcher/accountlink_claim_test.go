@@ -27,6 +27,9 @@ type accountLinkBackend struct {
 	// challenge/429/auth failures.
 	claimErr error
 	claims   int
+	// claimAttempts counts every Claim invocation, including failures.
+	// Terminal errors must result in exactly 1 attempt (no retry).
+	claimAttempts int
 }
 
 func newAccountLinkBackend() *accountLinkBackend {
@@ -60,6 +63,7 @@ func (b *accountLinkBackend) InventoryProgress(_ context.Context, _ platform.Ses
 func (b *accountLinkBackend) Claim(_ context.Context, _ platform.Session, benefit platform.DropBenefit) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.claimAttempts++
 	if b.claimErr != nil {
 		return b.claimErr
 	}
@@ -79,6 +83,12 @@ func (b *accountLinkBackend) claimCount() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.claims
+}
+
+func (b *accountLinkBackend) attemptCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.claimAttempts
 }
 
 func newAccountLinkWatcher(backend *accountLinkBackend) *Watcher {
@@ -137,8 +147,10 @@ func TestAccountLinkedZeroBelowThresholdNoClaim(t *testing.T) {
 	<-done
 }
 
-// TestClaimChallengeErrorStopsNoRetry verifies that challenge/429/auth
-// errors from the claim path surface and are not retried in a tight loop.
+// TestClaimChallengeErrorStopsNoRetry verifies that an integrity
+// challenge from the claim path stops immediately: exactly one Claim
+// invocation, the error is recorded, and no retry happens in this flow
+// or subsequent ticks.
 func TestClaimChallengeErrorStopsNoRetry(t *testing.T) {
 	backend := newAccountLinkBackend()
 	backend.claimErr = errors.New("twitch integrity challenge: missing client-integrity token")
@@ -151,17 +163,20 @@ func TestClaimChallengeErrorStopsNoRetry(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- w.Run(ctx) }()
 
-	// The watcher records the failure; the claim must not succeed.
-	time.Sleep(500 * time.Millisecond)
+	// Wait for the single claim attempt, then give extra ticks to prove
+	// it does NOT retry.
+	require.Eventually(t, func() bool {
+		return backend.attemptCount() >= 1
+	}, 2*time.Second, 2*time.Millisecond, "claim must be attempted once")
+	time.Sleep(800 * time.Millisecond)
+	assert.Equal(t, 1, backend.attemptCount(), "challenge error: claim must be invoked exactly once, no retry")
 	assert.Equal(t, 0, backend.claimCount(), "failed claim must not be counted as claimed")
 	cancel()
 	<-done
-	// If we get here without hanging or panicking, the error path
-	// stopped cleanly instead of spinning.
 }
 
 // TestClaim429ErrorStopsNoRetry verifies that HTTP 429 rate-limit errors
-// from the claim path do not trigger tight-loop retries.
+// stop immediately with exactly one Claim invocation and no retry.
 func TestClaim429ErrorStopsNoRetry(t *testing.T) {
 	backend := newAccountLinkBackend()
 	backend.claimErr = errors.New("twitch gql: HTTP 429 Too Many Requests")
@@ -174,14 +189,18 @@ func TestClaim429ErrorStopsNoRetry(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- w.Run(ctx) }()
 
-	time.Sleep(500 * time.Millisecond)
+	require.Eventually(t, func() bool {
+		return backend.attemptCount() >= 1
+	}, 2*time.Second, 2*time.Millisecond, "claim must be attempted once")
+	time.Sleep(800 * time.Millisecond)
+	assert.Equal(t, 1, backend.attemptCount(), "429 error: claim must be invoked exactly once, no retry")
 	assert.Equal(t, 0, backend.claimCount(), "429-failed claim must not be counted as claimed")
 	cancel()
 	<-done
 }
 
-// TestClaimAuthErrorStopsNoRetry verifies that authentication errors
-// from the claim path do not trigger tight-loop retries.
+// TestClaimAuthErrorStopsNoRetry verifies that HTTP 401/auth errors stop
+// immediately with exactly one Claim invocation and no retry.
 func TestClaimAuthErrorStopsNoRetry(t *testing.T) {
 	backend := newAccountLinkBackend()
 	backend.claimErr = errors.New("twitch gql: HTTP 401 Unauthorized: invalid access token")
@@ -194,7 +213,11 @@ func TestClaimAuthErrorStopsNoRetry(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- w.Run(ctx) }()
 
-	time.Sleep(500 * time.Millisecond)
+	require.Eventually(t, func() bool {
+		return backend.attemptCount() >= 1
+	}, 2*time.Second, 2*time.Millisecond, "claim must be attempted once")
+	time.Sleep(800 * time.Millisecond)
+	assert.Equal(t, 1, backend.attemptCount(), "401 error: claim must be invoked exactly once, no retry")
 	assert.Equal(t, 0, backend.claimCount(), "auth-failed claim must not be counted as claimed")
 	cancel()
 	<-done

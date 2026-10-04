@@ -910,7 +910,41 @@ var stepErrBackoff = 5 * time.Second
 // won't let us claim (e.g. null claimDropRewards) stays complete+unclaimed in
 // inventory, so without this the watcher re-picks it forever, starving
 // every other drop and re-notifying 100% each cycle.
+//
+// NOTE: This threshold applies ONLY to recoverable errors. Terminal errors
+// (integrity challenge, HTTP 429, HTTP 401/auth) bypass the counter entirely:
+// the benefit is marked terminally failed on the FIRST occurrence, with no
+// retry in the current flow or subsequent ticks. See isTerminalClaimError.
 const claimFailSkipThreshold = 3
+
+// isTerminalClaimError reports whether a claim error must stop immediately
+// with no retry. Terminal: integrity challenge, HTTP 429 rate limit, HTTP
+// 401/auth failures. These indicate the claim cannot succeed by retrying
+// (blocked, throttled, or credentialed out); retrying would hammer Twitch
+// or loop forever. All other errors use the claimFailSkipThreshold path.
+func isTerminalClaimError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Typed sentinel for integrity wall.
+	if errors.Is(err, platform.ErrIntegrityBlocked) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	// Integrity challenge (various phrasings).
+	if strings.Contains(msg, "integrity") && (strings.Contains(msg, "challenge") || strings.Contains(msg, "blocked") || strings.Contains(msg, "failed")) {
+		return true
+	}
+	// HTTP 429 rate limit.
+	if strings.Contains(msg, "429") || strings.Contains(msg, "rate limited") || strings.Contains(msg, "too many requests") {
+		return true
+	}
+	// HTTP 401 / auth failures.
+	if strings.Contains(msg, "401") || strings.Contains(msg, "unauthorized") || strings.Contains(msg, "invalid token") || strings.Contains(msg, "invalid access token") {
+		return true
+	}
+	return false
+}
 
 // forceWatchYieldInterval is how long a force-watch task runs before
 // yielding back to mining to check whether a real whitelisted drop has
@@ -2507,6 +2541,29 @@ func (w *Watcher) claim(ctx context.Context) error {
 			return fmt.Errorf("claim: %w", err)
 		}
 		slog.Error("watcher claim failed", "kind", "error", "account", w.cfg.AccountID, "benefit", benefit.ID, "err", err)
+		// Terminal errors (integrity challenge, 429, 401/auth) stop
+		// immediately: mark the benefit terminally failed with NO retry,
+		// neither in this flow nor in subsequent ticks. This bypasses the
+		// claimFailures counter entirely.
+		if isTerminalClaimError(err) {
+			w.mu.Lock()
+			if w.skippedBenefits == nil {
+				w.skippedBenefits = map[string]struct{}{}
+			}
+			w.skippedBenefits[benefit.ID] = struct{}{}
+			if w.claimFailSkipped == nil {
+				w.claimFailSkipped = map[string]int{}
+			}
+			w.claimFailSkipped[benefit.ID] = benefit.RequiredMinutes
+			// Ensure a stale failure count doesn't linger.
+			delete(w.claimFailures, benefit.ID)
+			w.mu.Unlock()
+			slog.Warn("watcher: claim hit terminal error; marking benefit failed with no retry",
+				"kind", "claim", "account", w.cfg.AccountID,
+				"benefit", benefit.ID, "benefit_name", benefit.Name, "err", err)
+			w.recordSkip(ctx, benefit.ID, benefit.Name)
+			return fmt.Errorf("claim terminal: %w", err)
+		}
 		w.mu.Lock()
 		if w.claimFailures == nil {
 			w.claimFailures = map[string]int{}
