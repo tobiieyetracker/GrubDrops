@@ -1407,7 +1407,6 @@ func (w *Watcher) pickCampaign(ctx context.Context) error {
 	// watcher skips them — minutes watched on an unlinked campaign
 	// don't translate to a claimable drop.
 	matched := make([]platform.Campaign, 0, len(whitelisted))
-	skippedUnlinked := 0
 	skippedReward := 0
 	for _, c := range whitelisted {
 		if c.Status != "" && c.Status != "active" {
@@ -1420,24 +1419,14 @@ func (w *Watcher) pickCampaign(ctx context.Context) error {
 			skippedReward++
 			continue
 		}
-		// Skip campaigns the account can't earn because the required
-		// external account isn't linked. Twitch always populates
-		// AccountLinked (isAccountConnected). Kick now sets
-		// AccountLinkChecked for connect_url campaigns (linked = the
-		// account is participating). Only skip when the link status was
-		// actually checked and came back false — never skip on an
-		// unverified default (avoids regressing platforms/paths that
-		// don't surface the flag).
+		// AccountLinked describes GAME-SIDE delivery status only (see
+		// platform.Campaign.AccountLinked). It is NOT a precondition for
+		// the Twitch-side claim: once a drop meets Twitch's claim
+		// conditions (minutes watched >= required), the local claim must
+		// proceed regardless of this flag. Log it for operator visibility
+		// but never skip the campaign on its basis.
 		if (c.Platform == "twitch" || c.AccountLinkChecked) && !c.AccountLinked {
-			// Manual "I've linked it" override: the user asserted the
-			// external account is connected, so attempt to mine despite the
-			// backend reporting unlinked. The live progress check confirms.
-			if w.cfg.ForceLinked != nil && w.cfg.ForceLinked(c.ID) {
-				slog.Info("watcher mining link-overridden campaign", "kind", "discovery", "account", w.cfg.AccountID, "campaign", c.Name)
-			} else {
-				skippedUnlinked++
-				continue
-			}
+			slog.Info("watcher campaign game-account unlinked (twitch claim still allowed)", "kind", "discovery", "account", w.cfg.AccountID, "campaign", c.Name)
 		}
 		// P3: exclude-game set short-circuits the pick. Whitelist
 		// already passed; exclude is a finer-grained skip without
@@ -1446,12 +1435,6 @@ func (w *Watcher) pickCampaign(ctx context.Context) error {
 			continue
 		}
 		matched = append(matched, c)
-	}
-	if skippedUnlinked > 0 {
-		slog.Info("watcher skipped unlinked campaigns",
-			"kind", "discovery",
-			"account", w.cfg.AccountID,
-			"count", skippedUnlinked)
 	}
 	if skippedReward > 0 {
 		slog.Info("watcher skipped reward campaigns",
@@ -1660,11 +1643,9 @@ func (w *Watcher) pickCampaign(ctx context.Context) error {
 	// campaign is gated behind an unlinked external account, surface that
 	// distinctly so the dashboard can prompt the user to connect rather
 	// than implying the account is simply idle with no work.
-	if len(matched) == 0 && skippedUnlinked > 0 {
-		slog.Info("watcher awaiting account connect", "kind", "discovery", "account", w.cfg.AccountID, "unlinked_campaigns", skippedUnlinked)
-		w.setState(ctx, StateAwaitingConnect)
-		return nil
-	}
+	// Note: account link status no longer gates campaign eligibility —
+	// unlinked campaigns are still mined and claimed on the Twitch side;
+	// the link flag only describes game-side delivery.
 	if w.cfg.AllowGame != nil && len(matched) == 0 && len(campaigns) > 0 {
 		slog.Info("watcher: no whitelisted games match active campaigns, sleeping", "account", w.cfg.AccountID, "active_campaigns", len(campaigns))
 	} else {
@@ -2049,11 +2030,8 @@ func (w *Watcher) preemptCandidates(campaigns []platform.Campaign, claimed, ownC
 		if c.Kind == "reward" {
 			continue
 		}
-		if (c.Platform == "twitch" || c.AccountLinkChecked) && !c.AccountLinked {
-			if w.cfg.ForceLinked == nil || !w.cfg.ForceLinked(c.ID) {
-				continue
-			}
-		}
+		// AccountLinked is game-side delivery status only — never a
+		// precondition for Twitch-side claim eligibility. Do not skip.
 		if w.cfg.ExcludeGame != nil && w.cfg.ExcludeGame(c.Game) {
 			continue
 		}

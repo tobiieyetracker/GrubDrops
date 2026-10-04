@@ -47,12 +47,17 @@ type Campaign struct {
 	Benefits []DropBenefit
 
 	// AccountLinked indicates whether the user has connected the
-	// external account this campaign requires for claims (e.g. Mojang
-	// for Minecraft, Battle.net for Diablo). Source: Twitch
-	// dropCampaign.self.isAccountConnected. False = user cannot
-	// actually receive the drop even if minutes are watched, so the
-	// watcher must skip these campaigns and the dashboard should
-	// surface a "Link account →" call to action.
+	// external game account this campaign requires for in-game
+	// delivery (e.g. Mojang for Minecraft, Battle.net for Diablo).
+	// Source: Twitch dropCampaign.self.isAccountConnected.
+	//
+	// IMPORTANT: This flag describes GAME-SIDE delivery status only.
+	// It is NOT a precondition for the Twitch-side claim. Once a drop
+	// meets Twitch's claim conditions (minutes watched >= required),
+	// the local Twitch claim MUST proceed regardless of AccountLinked.
+	// Twitch inventory claim and in-game delivery are separate states
+	// and must be recorded separately — a Twitch claim must never be
+	// reported as in-game redemption.
 	AccountLinked bool
 	// AccountLinkChecked is true if AccountLinked was derived from a
 	// real gql probe (self.isAccountConnected). False if it was set
