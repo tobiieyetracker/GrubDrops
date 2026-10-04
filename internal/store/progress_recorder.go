@@ -65,12 +65,11 @@ func (r *ProgressRecorder) UnclaimedProgress(ctx context.Context, accountID stri
 	}
 	// Use the current time for both bounds: we want campaigns that have
 	// started (starts_at <= now) and have not yet ended (ends_at >= now).
-	// The EndsAt gets a +1 day buffer for campaigns ending very soon.
 	now := time.Now().Unix()
 	rows, err := r.Q.ListUnclaimedProgressForAccount(ctx, gen.ListUnclaimedProgressForAccountParams{
 		AccountID: accountID,
 		StartsAt:  now,
-		EndsAt:    now + 86400,
+		EndsAt:    now,
 	})
 	if err != nil {
 		return nil, err

@@ -33,8 +33,14 @@ All notable changes to GrubDrops.
   scans converge on the highest-ranked live target within
   (ceil(H/3)+1) scan cycles, H = higher-ranked eligible candidates.
 
+### Changed
+
+- **An unlinked game account no longer blocks a Twitch inventory claim.** `account_linked` describes game-side delivery; once Twitch watch-time conditions are met, the miner can claim the reward into Twitch inventory. A recorded claim does not imply that the game received the item.
+
 ### Fixed
 
+- **Claim challenges, rate limits, and authentication errors no longer trigger automatic retries.** These terminal errors stop the current claim attempt and mark the benefit as skipped.
+- **Externally claimed drops are reconciled instead of being mined again.** When a drop with recorded positive progress disappears from the active in-progress inventory, the watcher marks it claimed locally. Reconciliation includes campaigns that are close to their end time.
 - **Games whose Twitch directory slug differs from the guessed slug are
   discovered again.** Directory lookups built the slug locally from the
   display name (`gameslug.Slug`), but Twitch's canonical slug doesn't always

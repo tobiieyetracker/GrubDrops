@@ -54,3 +54,42 @@ func TestProgressRecorder_IsAccountScopedAndStoresZeroObservations(t *testing.T)
 	require.NoError(t, recorder.RecordProgress(ctx, "acc-a", "drop-1", 24))
 	require.EqualValues(t, 24, readMinutes("acc-a"))
 }
+
+func TestProgressRecorder_UnclaimedProgressIncludesCampaignEndingSoon(t *testing.T) {
+	db := openTest(t)
+	q := gen.New(db)
+	ctx := context.Background()
+	now := time.Now().Unix()
+	_, err := q.CreateAccount(ctx, gen.CreateAccountParams{
+		ID: "acc-progress", Platform: "twitch", DisplayName: "acc-progress",
+		Status: "idle", FingerprintJson: "{}", Enabled: 1,
+		CreatedAt: now, UpdatedAt: now,
+	})
+	require.NoError(t, err)
+
+	for _, campaign := range []struct {
+		id     string
+		endsAt int64
+	}{
+		{id: "ending-soon", endsAt: now + 1800},
+		{id: "already-ended", endsAt: now - 60},
+	} {
+		require.NoError(t, q.UpsertCampaign(ctx, gen.UpsertCampaignParams{
+			ID: campaign.id, Platform: "twitch", Game: "Test", Name: campaign.id,
+			StartsAt: now - 3600, EndsAt: campaign.endsAt, Status: "active",
+			RawJson: "{}", DiscoveredAt: now, Kind: "drop",
+		}))
+		require.NoError(t, q.UpsertBenefit(ctx, gen.UpsertBenefitParams{
+			ID: campaign.id + "-drop", CampaignID: campaign.id,
+			Name: "Drop", RequiredMinutes: 60,
+		}))
+		require.NoError(t, q.UpsertProgress(ctx, gen.UpsertProgressParams{
+			AccountID: "acc-progress", BenefitID: campaign.id + "-drop",
+			MinutesWatched: 30, UpdatedAt: now,
+		}))
+	}
+
+	progress, err := NewProgressRecorder(q).UnclaimedProgress(ctx, "acc-progress")
+	require.NoError(t, err)
+	require.Equal(t, map[string]int64{"ending-soon-drop": 30}, progress)
+}

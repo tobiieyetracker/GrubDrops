@@ -117,6 +117,44 @@ func (r *recordingProgressRecorder) snapshot() []recordedProgress {
 	return append([]recordedProgress(nil), r.rows...)
 }
 
+type externallyClaimedProgressRecorder struct {
+	marked map[string]bool
+}
+
+func (r *externallyClaimedProgressRecorder) RecordProgress(context.Context, string, string, int) error {
+	return nil
+}
+
+func (r *externallyClaimedProgressRecorder) MarkClaimed(_ context.Context, _, benefitID string) error {
+	if r.marked == nil {
+		r.marked = map[string]bool{}
+	}
+	r.marked[benefitID] = true
+	return nil
+}
+
+func (r *externallyClaimedProgressRecorder) UnclaimedProgress(context.Context, string) (map[string]int64, error) {
+	return map[string]int64{"drop1": 12}, nil
+}
+
+func TestWatcher_ExternallyClaimedBenefitPersistsSkip(t *testing.T) {
+	ctx := context.Background()
+	backend := &vanishBackend{MockBackend: platformtest.New()}
+	progress := &externallyClaimedProgressRecorder{}
+	skips := newRecordingSkipRecorder()
+	w := New(Config{
+		AccountID:        "acc-external-claim",
+		Backend:          backend,
+		Session:          platform.Session{AccessToken: "tok"},
+		ProgressRecorder: progress,
+		SkipRecorder:     skips.recordSkip,
+	})
+
+	require.NoError(t, w.pickCampaign(ctx))
+	assert.True(t, progress.marked["drop1"], "vanished progress should be marked claimed")
+	assert.True(t, skips.skips("acc-external-claim")["drop1"], "vanished benefit skip should survive a restart")
+}
+
 type inventoryProgressBackend struct {
 	*platformtest.MockBackend
 	rows []platform.Progress
@@ -1338,7 +1376,7 @@ func TestWatcher_ForceWatchesWhenIdle(t *testing.T) {
 		Session:           platform.Session{AccessToken: "tok"},
 		Notifier:          &recordingNotifier{},
 		TickInterval:      5 * time.Millisecond,
-		HeartbeatInterval: 5 * time.Millisecond, // heartbeat every tick for test speed
+		HeartbeatInterval: 5 * time.Millisecond,               // heartbeat every tick for test speed
 		AllowGame:         func(string) bool { return false }, // nothing mineable
 		ForceWatcher:      fakeForce{channel: "xqc"},
 	})

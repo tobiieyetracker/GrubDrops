@@ -1269,6 +1269,10 @@ func (w *Watcher) pickCampaign(ctx context.Context) error {
 							"account", w.cfg.AccountID, "benefit", benefitID, "err", err)
 					} else {
 						claimed[benefitID] = true
+						// Keep the decision across watcher cycles and restarts,
+						// including when discovery temporarily returned no campaigns
+						// and the claims-table reconcile could not run.
+						w.recordSkip(ctx, benefitID, "externally claimed")
 					}
 				}
 			}
