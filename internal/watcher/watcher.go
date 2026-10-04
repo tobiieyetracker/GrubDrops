@@ -2557,11 +2557,19 @@ func (w *Watcher) claim(ctx context.Context) error {
 			w.claimFailSkipped[benefit.ID] = benefit.RequiredMinutes
 			// Ensure a stale failure count doesn't linger.
 			delete(w.claimFailures, benefit.ID)
+			// Clear the current benefit and stop the watch so the next
+			// tick cannot re-enter StateClaiming for this benefit.
+			// The skippedBenefits set (checked in candidate selection)
+			// prevents re-picking it.
+			w.currentBenefit = nil
 			w.mu.Unlock()
+			_ = w.cfg.Backend.StopWatch(ctx, handle)
+			w.unsubscribeCurrentChannel()
 			slog.Warn("watcher: claim hit terminal error; marking benefit failed with no retry",
 				"kind", "claim", "account", w.cfg.AccountID,
 				"benefit", benefit.ID, "benefit_name", benefit.Name, "err", err)
 			w.recordSkip(ctx, benefit.ID, benefit.Name)
+			w.setState(ctx, StatePickCampaign)
 			return fmt.Errorf("claim terminal: %w", err)
 		}
 		w.mu.Lock()
