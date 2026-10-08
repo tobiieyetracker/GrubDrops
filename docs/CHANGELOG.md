@@ -6,6 +6,15 @@ All notable changes to GrubDrops.
 
 ### Added
 
+- **Campaign exports include source-verified dates and Twitch game IDs.** The
+  database stores Twitch's numeric category ID separately from GrubDrops'
+  internal game IDs. Unknown dates stay empty, and legacy timestamps are marked
+  unverified instead of being exported as Twitch campaign times.
+- **Ending-soonest mode can mine across games.** It considers every active
+  campaign returned by the account backend, orders known deadlines first, and
+  does not require a game whitelist. Full coverage depends on a backend that
+  can see Twitch's campaign dashboard; TV-client discovery remains limited to
+  its inventory and configured game directories.
 - **Watcher-owned progress persistence and an authenticated status endpoint.**
   Every successful inventory poll now persists all known timed-drop progress
   rows, including observed zero-minute rows, without relying on dashboard
@@ -35,10 +44,18 @@ All notable changes to GrubDrops.
 
 ### Changed
 
+- **Docker Compose discovers Twitch campaigns across games by default.** It
+  starts a shared authenticated browser sidecar and routes account discovery
+  through the Twitch campaign page and dashboard, instead of limiting results
+  to configured games and a small set of channels.
 - **An unlinked game account no longer blocks a Twitch inventory claim.** `account_linked` describes game-side delivery; once Twitch watch-time conditions are met, the miner can claim the reward into Twitch inventory. A recorded claim does not imply that the game received the item.
 
 ### Fixed
 
+- **Twitch campaign discovery no longer stops at an empty game list.** Catalog-capable
+  Twitch sessions can now persist campaign shells before any game is prioritized,
+  while skipping reward-detail requests for unselected games. Providers without a
+  bounded catalog-only path (including Kick) remain idle until a game is opted in.
 - **Claim challenges, rate limits, and authentication errors no longer trigger automatic retries.** These terminal errors stop the current claim attempt and mark the benefit as skipped.
 - **Externally claimed drops are reconciled instead of being mined again.** When a drop with recorded positive progress disappears from the active in-progress inventory, the watcher marks it claimed locally. Reconciliation includes campaigns that are close to their end time.
 - **Games whose Twitch directory slug differs from the guessed slug are

@@ -21,9 +21,9 @@ type twitchSessionSource func(ctx context.Context) (string, platform.Session, bo
 // has (HTTP backend, or BrowserBackend when GRUB_TWITCH_BROWSER=1 —
 // the latter is required when Twitch's integrity wall is up). Scrape
 // applies a GameFilter built from the union whitelist so the backend
-// short-circuits non-whitelisted games BEFORE the per-campaign detail
-// fetch fan-out — saves bandwidth and keeps the project_goal.md rule
-// honored (never consider non-whitelisted drops).
+// short-circuits non-whitelisted games before per-campaign detail fetches.
+// Catalog-only discovery can persist shells, but the watcher never mines a
+// game until it is explicitly opted in.
 //
 // When no enabled Twitch account exists or its session is missing /
 // expired, Scrape returns (nil, nil) — the Scraper logs once and moves
@@ -80,6 +80,20 @@ func NewTwitchScraperFromStore(q *gen.Queries, sessions *store.SessionStore, bac
 func (s *TwitchScraper) Name() string { return "twitch" }
 
 func (s *TwitchScraper) Scrape(ctx context.Context, whitelist []string) ([]platform.Campaign, error) {
+	return s.scrape(ctx, whitelist)
+}
+
+// ScrapeCatalog uses Twitch's authenticated campaign catalog without a game
+// opt-in. The empty GameFilter deliberately prevents DropCampaignDetails
+// fan-out, so unselected campaigns are persisted only as catalog shells.
+// TV-client sessions cannot see Twitch's full drops dashboard; their backend
+// can only contribute campaigns already present in Inventory until a game is
+// added to the whitelist and its channel directory is crawled.
+func (s *TwitchScraper) ScrapeCatalog(ctx context.Context) ([]platform.Campaign, error) {
+	return s.scrape(ctx, nil)
+}
+
+func (s *TwitchScraper) scrape(ctx context.Context, whitelist []string) ([]platform.Campaign, error) {
 	if s == nil || s.Backend == nil || s.Source == nil {
 		return nil, nil
 	}

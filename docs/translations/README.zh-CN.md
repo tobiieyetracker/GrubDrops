@@ -49,12 +49,13 @@ GrubDrops 会替你观看合适的 Twitch 与 Kick 直播，累积观看时长�
 | | Twitch | Kick |
 |---|---|---|
 | **登录** | 设备码（`twitch.tv/activate`） | `cookies.txt` 导出 |
-| **观看方式** | 直连 HTTP — 无需浏览器 | Chrome **边车容器**（真实 IVS 播放） |
-| **Docker** | 可选 | **必需** — 挖矿器通过 docker socket 启动边车容器 |
-| **从源码运行，无需 Docker** | ✅ 普通的 `go build` 二进制即可 | ❌ 边车容器需要 Docker |
+| **活动发现** | Docker Compose 默认使用登录后的浏览器页面和 GraphQL，跨游戏发现该账号可见的活动 | 按活动发现频道 |
+| **观看方式** | Docker Compose 使用登录后的浏览器边车；直连 HTTP 仍可作为回退 | Chrome **边车容器**（真实 IVS 播放） |
+| **Docker** | 推荐使用 Compose 的浏览器边车来跨游戏发现活动；直连模式仍可用但发现范围有限 | **必需** — 挖矿器通过 docker socket 启动边车容器 |
+| **从源码运行，无需 Docker** | ✅ 普通的 `go build` 二进制可运行直连模式 | ❌ 边车容器需要 Docker |
 | **CPU 架构** | 任意 — `amd64` + `arm64` | `amd64` + `arm64`（arm64 资源占用高 —— 见说明） |
 
-Twitch 走直连 HTTP，所以一个普通的 Go 二进制文件在任何地方都能挖它 —— 包括树莓派（Raspberry Pi），无需 Docker。**Kick 的观看时长需要一个真实的播放器**，因此挖矿器会通过 docker socket 运行一个 Chrome/Chromium 边车容器 —— 这就使得 **Kick 必须依赖 Docker**。
+Docker Compose 默认运行一个共享的 Chrome/Chromium 边车，用于从登录后的 Twitch 活动页面发现该账号跨游戏可见的活动。普通 Go 二进制仍可运行直连 HTTP 模式，但 TV-client 会话只能从已配置游戏目录和账号 Inventory 发现活动。**Kick 的观看时长需要一个真实的播放器**，因此挖矿器会通过 docker socket 按需运行 Chrome/Chromium 边车容器 —— 这就使得 **Kick 必须依赖 Docker**。
 
 > **树莓派 / ARM：** 两个镜像都发布了 `arm64` 版本；边车容器在 arm64 上使用 Debian Chromium（保留解码 Kick IVS 流所需的 H.264/AAC 编解码器）。可用，但很重 —— 每个边车约 4 GB 内存，所以低内存的树莓派只能同时跑几个 Kick 账户。
 >
@@ -72,10 +73,10 @@ Twitch 走直连 HTTP，所以一个普通的 Go 二进制文件在任何地方�
 
 ### 运行它
 
-使用已发布镜像的 Docker Compose 是最快的路径 —— 只需运行
-**miner**。对于 Kick 观看时长，它会按需为每个账户自动创建一个启用了编解码器的
-Chrome **边车容器**（通过挂载的 docker socket），所以你
-不必自己定义任何边车服务。（只用 Twitch？见下文。）
+使用已发布镜像的 Docker Compose 是最快的路径。它会运行 **miner** 和一个共享的
+Twitch 浏览器边车，以发现每个账号跨游戏可见的活动。对于 Kick 观看时长，矿工仍会
+按需为每个账户自动创建一个启用了编解码器的 Chrome **边车容器**（通过挂载的
+docker socket）。
 
 ```yaml
 # compose.yml
@@ -88,12 +89,18 @@ services:
       GRUB_MASTER_KEY: "${GRUB_MASTER_KEY:?generate one with docker run --rm ghcr.io/aalejandrofer/grubdrops:latest keygen}"
       GRUB_DB_PATH: /data/miner.db
       GRUB_SECURE_COOKIES: "0"   # plain-HTTP localhost; set 1 behind HTTPS
+      GRUB_BROWSER_URL: browser:9090
+      GRUB_TWITCH_BROWSER: "1"
     volumes:
       # The container runs as nonroot (UID 65532); make ./data writable by it
       # first (see below) or use a named volume instead of a bind mount.
       - ./data:/data
       # lets the miner create/start/stop per-account browser sidecars on demand
       - /var/run/docker.sock:/var/run/docker.sock
+
+  browser:
+    image: ghcr.io/aalejandrofer/grubdrops-browser:latest
+    restart: unless-stopped
 ```
 
 **先让数据目录可写。** 挖矿器镜像以 distroless 的
@@ -129,9 +136,8 @@ GRUB_MASTER_KEY="$(docker run --rm ghcr.io/aalejandrofer/grubdrops:latest keygen
   `GRUB_MASTER_KEY`（上面 `keygen` 输出的值）填到 stack 的 **Environment variables**
   一栏。请使用普通的 `docker compose`，不要用 Swarm stack，并保持 Docker Engine 为较新版本。
 
-**只用 Twitch？** 去掉 docker-socket 挂载，并让 `GRUB_BROWSER_URL`
-保持未设置 —— 这样就永远不会创建 Kick 边车容器（没有边车容器，Kick 根本没有累积观看
-时长的途径）。
+**只用 Twitch？** 去掉 docker-socket 挂载；保留 `browser` 服务和
+`GRUB_BROWSER_URL=browser:9090`，否则会退回发现范围有限的直连模式。
 
 **想要每一个调节项？** 完整的参考 compose 文件（边车 profile、OIDC、每一项
 设置都带注释）位于
@@ -164,9 +170,9 @@ kick.com 会话以从浏览器导出的 `cookies.txt` 文件形式交给 GrubDro
 
 ## 选择要挖矿的内容
 
-GrubDrops 由白名单驱动：它只会发现并挖取你主动加入的游戏，所以
-**全新安装在你把至少一个游戏加入白名单之前不会挖任何东西**。在那之前，`/drops`
-会显示一条指向这里的提示，账户则停留在“尚无游戏”状态（这不是错误）。
+GrubDrops 将活动发现和挖矿选择分开。Docker Compose 默认发现每个 Twitch
+账号当前可见的跨游戏活动；游戏优先列表决定 ordered 模式下先挖哪些游戏。
+直连 HTTP 的 TV-client 会话仍只扫描已配置游戏目录和账号 Inventory。
 
 两种方式都可以添加游戏，直接按名称添加，不需要等某个活动先出现：
 
@@ -223,7 +229,7 @@ GrubDrops 由白名单驱动：它只会发现并挖取你主动加入的游戏�
 | `GRUB_KICK_SIDECAR_NETWORK` | 自动检测 | 要把边车容器接入的 Docker 网络。默认为挖矿器自身所在的网络（自动检测）；设置以覆盖。 |
 | `GRUB_KICK_SIDECAR_TEMPLATE` | `grubdrops-browser-{slug}` | 按账户的边车容器名称模板。 |
 | `GRUB_KICK_SIDECAR_PORT` | `9090` | 边车容器的 gRPC 端口。 |
-| `GRUB_BROWSER_URL` | 无 | 固定的边车地址（旧版常驻模式）。 |
+| `GRUB_BROWSER_URL` | 无 | 共享浏览器边车 gRPC 地址；Docker Compose 默认设为 `browser:9090`。 |
 | `GRUB_BROWSER_URLS` | 无 | 逗号分隔的常驻边车容器池（每个 Kick 账户一个 Chrome）。 |
 | `GRUB_DISCOVERY_INTERVAL` | `60m` | 目录扫描节奏（例如 `30m`、`2h`）；也可在 Settings 中编辑。 |
 | `GRUB_AUTHCHECK_INTERVAL` | `12h` | 认证健康检查的扫描节奏。 |
@@ -231,7 +237,7 @@ GrubDrops 由白名单驱动：它只会发现并挖取你主动加入的游戏�
 | `GRUB_SECURE_COOKIES` | `0` | 安全会话 cookie + CSRF 同源方案。通过纯 HTTP（`http://pi:8080`）访问时保持 `0`；仅当通过 HTTPS 访问时（直接访问，或位于设置 `X-Forwarded-Proto: https` 的 TLS 终结代理之后）才设为 `1`。见下方说明。 |
 | `GRUB_LOG_LEVEL` | `info` | `debug`、`info`、`warn`、`error`。 |
 | `GRUB_AUTHBYPASS` | `false` | 为真值（`1`/`true`）时**禁用所有鉴权**。 |
-| `GRUB_TWITCH_BROWSER` | `0` | 设为 `1` 时通过浏览器 sidecar 路由 Twitch，而非直接 HTTP。实验性；建议使用默认的直接 HTTP 路径。 |
+| `GRUB_TWITCH_BROWSER` | `0` | 设为 `1` 时通过登录后的浏览器边车发现 Twitch 活动。Docker Compose 默认设为 `1`，以支持跨游戏发现；设为 `0` 会回到范围有限的直连 Discovery。 |
 | `GRUB_CANARY_INTERVAL` | 健康检查页的值 | 覆盖积累探针的运行周期（如 `6h`）；未设置时回退到 设置 ▸ 健康检查 的值。 |
 
 > **自托管 / "invalid CSRF token"：** `GRUB_SECURE_COOKIES` 必须与你

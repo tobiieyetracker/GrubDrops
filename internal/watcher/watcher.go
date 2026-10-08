@@ -103,17 +103,16 @@ type Config struct {
 	// Defaults to math.MaxInt when AllowGame is nil.
 	GameRank func(game string) int
 
-	// PriorityMode picks the ordering policy when multiple
-	// whitelisted campaigns are eligible. "ordered" sorts by
-	// GameRank (whitelist top-down); "ending_soonest" sorts by the
-	// campaign's EndsAt ascending. Empty defaults to "ordered".
+	// PriorityMode picks the campaign pool and ordering policy. "ordered"
+	// watches only whitelisted games in GameRank order; "ending_soonest"
+	// watches every active campaign returned by the account backend and sorts
+	// by EndsAt. Empty defaults to "ordered".
 	PriorityMode string
 
 	// Persister, when set, receives every campaign the backend discovered
-	// after the watcher's whitelist filter has been applied. Used so the
-	// /drops page can render past + current + upcoming rows even before
-	// anything has been claimed. Non-whitelisted campaigns are NEVER
-	// passed to the persister.
+	// before mining-mode filters are applied. Used so /drops can render the
+	// full discovered catalog, including candidates outside the ordered-mode
+	// game list.
 	Persister CampaignPersister
 
 	// ClaimRecorder, when set, persists a claims row each time the
@@ -322,10 +321,11 @@ func New(cfg Config) *Watcher {
 		cfg.TickInterval = time.Minute
 	}
 	cfg.Session.AccountID = cfg.AccountID
-	// Plumb the whitelist into the Session so backends can short-circuit
-	// non-whitelisted games before doing per-campaign detail fetches.
-	// Same closure backs both layers — the whitelist is canonical.
-	if cfg.Session.GameFilter == nil {
+	// Ordered mode can avoid detail requests outside the selected games.
+	// Ending-soonest mode needs full campaign benefits to mine across games.
+	if cfg.PriorityMode == "ending_soonest" {
+		cfg.Session.GameFilter = nil
+	} else if cfg.Session.GameFilter == nil {
 		cfg.Session.GameFilter = cfg.AllowGame
 	}
 	if cfg.Session.Games == nil {
@@ -1405,12 +1405,13 @@ func (w *Watcher) pickCampaign(ctx context.Context) error {
 		}
 	}
 
-	// Apply the per-account whitelist to EVERYTHING the backend returned —
-	// active, expired, upcoming. Non-whitelisted campaigns are dropped
-	// here so they never reach the mining loop. (They DID reach the
-	// persister above so /drops Discoverable can list them.)
+	// Ordered mode applies the game/channel allow-list to everything the
+	// backend returned. Ending-soonest mode uses the account's full active
+	// campaign set, independent of its game priority list.
 	var whitelisted []platform.Campaign
-	if w.cfg.AllowGame != nil || w.cfg.AllowChannel != nil {
+	if w.cfg.PriorityMode == "ending_soonest" {
+		whitelisted = append([]platform.Campaign(nil), campaigns...)
+	} else if w.cfg.AllowGame != nil || w.cfg.AllowChannel != nil {
 		whitelisted = make([]platform.Campaign, 0, len(campaigns))
 		for _, c := range campaigns {
 			gameOK := w.cfg.AllowGame != nil && w.cfg.AllowGame(c.Game)
@@ -1437,13 +1438,8 @@ func (w *Watcher) pickCampaign(ctx context.Context) error {
 	w.mu.Unlock()
 	w.persistInventoryProgress(ctx, progress)
 
-	// For mining, keep only ACTIVE + ACCOUNT-LINKED campaigns. Sort by
-	// whitelist rank (lower = higher priority). Empty Status is treated
-	// as "active" for backwards compatibility with the platformtest
-	// MockBackend. Non-linked campaigns stay visible in the discovery
-	// cache (so the dashboard can prompt "Link account →") but the
-	// watcher skips them — minutes watched on an unlinked campaign
-	// don't translate to a claimable drop.
+	// For mining, keep only ACTIVE campaigns. AccountLinked is game-side
+	// delivery status and never gates Twitch-side accrual or claiming.
 	matched := make([]platform.Campaign, 0, len(whitelisted))
 	skippedReward := 0
 	for _, c := range whitelisted {

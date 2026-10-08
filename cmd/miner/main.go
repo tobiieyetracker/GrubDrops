@@ -432,23 +432,23 @@ func run() error {
 				"account", a.ID, "err", err)
 			return scheduler.NewEntry(a.ID, nopRunner{}), nil
 		}
+		// PriorityMode is a global setting — read once per build (i.e.
+		// per Reload). Ending-soonest mode intentionally works without a
+		// game whitelist and considers every campaign returned by this
+		// account's backend.
+		priorityModeVal, priorityModeErr := settingsStore.PriorityMode(ctx)
+		priorityMode := settingOr(logger, priorityModeVal, priorityModeErr, store.PriorityModeOrdered, "priority_mode")
 		allowChannel, err := loadAccountChannels(ctx, q, a.ID)
 		if err != nil {
 			return scheduler.Entry{}, err
 		}
-		if !hasAnyGame(allow) {
+		if !hasAnyGame(allow) && priorityMode != store.PriorityModeEndingSoonest {
 			logger.Info("account has empty game whitelist, idle until games are picked",
 				"account", a.ID)
 			// Authed but nothing to mine yet — surface as "no_games", NOT
 			// the misleading "session expired" auth banner.
 			return scheduler.NewEntry(a.ID, nopRunner{reason: "no_games"}), nil
 		}
-
-		// PriorityMode is a global setting — read once per build (i.e.
-		// per Reload). Watcher snapshots the value for the lifetime of
-		// the entry; the next Reload picks up changes.
-		priorityModeVal, priorityModeErr := settingsStore.PriorityMode(ctx)
-		priorityMode := settingOr(logger, priorityModeVal, priorityModeErr, store.PriorityModeOrdered, "priority_mode")
 
 		// Runtime cadence + progress-notify granularity — read per build (per
 		// Reload) so saving on /settings + reloading takes effect.

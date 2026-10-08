@@ -128,6 +128,25 @@ func TestTwitchScraper_AttachesGameFilterAndFilters(t *testing.T) {
 	assert.Equal(t, "acc-1", b.gotSession.AccountID, "session must carry the source's AccountID")
 }
 
+func TestTwitchScraper_ScrapeCatalogUsesEmptyFilter(t *testing.T) {
+	b := &stubBackend{result: []platform.Campaign{
+		{ID: "c-witcher", Platform: "twitch", Game: "The Witcher 3: Wild Hunt", Name: "The Witcher 3: Wild Hunt Remastered"},
+	}}
+	source := func(context.Context) (string, platform.Session, bool, error) {
+		return "acc-1", platform.Session{AccessToken: "tok"}, true, nil
+	}
+	s := NewTwitchScraper(b, source)
+	camps, err := s.ScrapeCatalog(context.Background())
+	require.NoError(t, err)
+	require.Len(t, camps, 1)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	require.NotNil(t, b.gotSession.GameFilter)
+	assert.False(t, b.gotSession.GameFilter("The Witcher 3: Wild Hunt"), "catalog path must skip unselected game details")
+	assert.Empty(t, b.gotSession.Games)
+}
+
 // Task 5: TV-client sessions (Session.ClientID == twitch.ClientTV) can't see
 // Twitch's drops dashboard, so chandisc.go's listByChannels walks one game
 // directory per name in Session.Games instead. Scrape must plumb the

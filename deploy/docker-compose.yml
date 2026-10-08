@@ -1,10 +1,21 @@
 services:
+  # Authenticated Twitch campaign discovery uses the campaign page in a
+  # real browser context. The same sidecar also supports legacy Kick flows.
+  browser:
+    image: ghcr.io/aalejandrofer/grubdrops-browser:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.browser
+    restart: unless-stopped
+
   miner:
     image: ghcr.io/aalejandrofer/grubdrops:latest
     build:
       context: ..
       dockerfile: deploy/Dockerfile.miner
     restart: unless-stopped
+    depends_on:
+      - browser
     ports:
       - "8080:8080"
     environment:
@@ -17,11 +28,10 @@ services:
       # "Claims Today" midnight reset. Uses Go's IANA database.
       # Examples: Asia/Shanghai, America/New_York, Europe/London
       TZ: ${TZ:-UTC}
-      # Legacy fixed sidecar address. Leave empty — for Kick the miner
-      # auto-creates a Chrome sidecar per account on demand over the mounted
-      # docker socket (no sidecar service to define). Set only to pin a
-      # pre-existing always-on sidecar.
-      GRUB_BROWSER_URL: ${GRUB_BROWSER_URL:-}
+      # Shared authenticated browser context for full Twitch campaign
+      # discovery. Set to empty only when opting back into direct HTTP mode.
+      GRUB_BROWSER_URL: ${GRUB_BROWSER_URL:-browser:9090}
+      GRUB_TWITCH_BROWSER: ${GRUB_TWITCH_BROWSER:-1}
       # Kick sidecar config
       GRUB_KICK_SIDECAR_TEMPLATE: ${GRUB_KICK_SIDECAR_TEMPLATE:-grubdrops-browser-{slug}}
       GRUB_KICK_SIDECAR_PORT: ${GRUB_KICK_SIDECAR_PORT:-9090}
@@ -45,10 +55,9 @@ services:
       # docker socket. Mount it for Kick. Omit it for a Twitch-only setup.
       - /var/run/docker.sock:/var/run/docker.sock
 
-  # No sidecar service to define — the miner pulls + runs the
-  # ghcr.io/aalejandrofer/grubdrops-browser image per Kick account on demand
-  # (see GRUB_KICK_SIDECAR_* above). Build that image with
-  # `docker build -f deploy/Dockerfile.browser .`.
+  # Kick watch-time still uses on-demand per-account Chrome sidecars created
+  # through the mounted Docker socket. The shared browser service above is for
+  # authenticated Twitch discovery and legacy browser-backed flows.
 
   # Optional auto-update. Watchtower polls ghcr and, when a new GrubDrops image
   # is published, pulls it and recreates ONLY the miner container (the trailing

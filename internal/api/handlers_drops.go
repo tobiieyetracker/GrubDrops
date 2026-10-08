@@ -1,8 +1,10 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/csv"
 	"encoding/json"
 	"log/slog"
 	"math"
@@ -23,13 +25,99 @@ import (
 )
 
 type dropsDeps struct {
+	db       *sql.DB
 	loc      *timeutil.Zone // display timezone (live; setting → TZ env → UTC)
 	q        *gen.Queries
+	settings *store.Settings
 	t        Renderer
 	reload   func(context.Context) error
 	sessions *store.SessionStore
 	registry *platform.Registry
 	sm       *scs.SessionManager // flash messages after whitelist actions
+}
+
+func (d *dropsDeps) exportCSV(w http.ResponseWriter, r *http.Request) {
+	if d.db == nil {
+		http.Error(w, "database unavailable", http.StatusInternalServerError)
+		return
+	}
+	rows, err := d.db.QueryContext(r.Context(), `
+		SELECT id, platform, name, game, twitch_game_id, twitch_game_slug, status,
+		       starts_at, ends_at, starts_at_source, ends_at_source, discovered_at
+		FROM campaigns
+		ORDER BY discovered_at DESC, id ASC`)
+	if err != nil {
+		http.Error(w, "campaign export unavailable", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var body bytes.Buffer
+	_, _ = body.Write([]byte{0xEF, 0xBB, 0xBF})
+	writer := csv.NewWriter(&body)
+	if err := writer.Write([]string{
+		"campaign_id", "platform", "campaign_name", "game_name", "twitch_game_id", "twitch_game_slug",
+		"status", "start_at", "end_at", "start_at_source", "end_at_source", "discovered_at",
+	}); err != nil {
+		http.Error(w, "campaign export unavailable", http.StatusInternalServerError)
+		return
+	}
+	for rows.Next() {
+		var id, plat, campaignName, game, gameID, gameSlug, status, startsSource, endsSource string
+		var startsAt, endsAt, discoveredAt int64
+		if err := rows.Scan(&id, &plat, &campaignName, &game, &gameID, &gameSlug, &status,
+			&startsAt, &endsAt, &startsSource, &endsSource, &discoveredAt); err != nil {
+			http.Error(w, "campaign export unavailable", http.StatusInternalServerError)
+			return
+		}
+		startValue := exportCampaignTime(startsAt, startsSource)
+		endValue := exportCampaignTime(endsAt, endsSource)
+		discoveredValue := ""
+		if discoveredAt > 0 {
+			discoveredValue = time.Unix(discoveredAt, 0).UTC().Format(time.RFC3339)
+		}
+		if err := writer.Write([]string{
+			csvSafeCell(id), csvSafeCell(plat), csvSafeCell(campaignName), csvSafeCell(game),
+			csvSafeCell(gameID), csvSafeCell(gameSlug), csvSafeCell(status), startValue, endValue,
+			startsSource, endsSource, discoveredValue,
+		}); err != nil {
+			http.Error(w, "campaign export unavailable", http.StatusInternalServerError)
+			return
+		}
+	}
+	if rows.Err() != nil {
+		http.Error(w, "campaign export unavailable", http.StatusInternalServerError)
+		return
+	}
+	writer.Flush()
+	if writer.Error() != nil {
+		http.Error(w, "campaign export unavailable", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="grubdrops-campaigns.csv"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body.Bytes())
+}
+
+func exportCampaignTime(unix int64, source string) string {
+	if unix <= 0 || (source != "twitch" && source != "kick") {
+		return ""
+	}
+	return time.Unix(unix, 0).UTC().Format(time.RFC3339)
+}
+
+func csvSafeCell(value string) string {
+	trimmed := strings.TrimLeft(value, " \t\r\n")
+	if trimmed == "" {
+		return value
+	}
+	switch trimmed[0] {
+	case '=', '+', '-', '@':
+		return "'" + value
+	default:
+		return value
+	}
 }
 
 // lazyFetchBenefits backfills a campaign's benefits the first time its
@@ -280,11 +368,9 @@ type dropsPage struct {
 	NullGameRows []dropsRow
 	Accounts     []dropsAccount // for the "add to whitelist" dropdown on unlisted rows
 	CSRFToken    string         // mirrors templateData.CSRFToken for inline form
-	// NoWhitelist is true when no game is whitelisted anywhere (per-account or
-	// global). Discovery only crawls whitelisted games, so an empty whitelist
-	// means the page is silently empty — a cold-start trap. The template shows
-	// a bootstrap CTA in this case instead of misleading "discovery populates
-	// this" empty text.
+	// NoWhitelist is true when no game is whitelisted anywhere and the global
+	// mode is not set to ending-soonest, which mines all active campaigns
+	// returned by the account backend.
 	NoWhitelist bool
 }
 
@@ -438,10 +524,17 @@ func (d *dropsDeps) list(w http.ResponseWriter, r *http.Request) {
 	}
 
 	allow, hasWhitelist := allowedGamesUnion(r.Context(), d.q)
+	priorityMode := store.PriorityModeOrdered
+	if d.settings != nil {
+		if mode, err := d.settings.PriorityMode(r.Context()); err == nil {
+			priorityMode = mode
+		}
+	}
+	allCampaignsMode := priorityMode == store.PriorityModeEndingSoonest
 	now := time.Now().Unix()
 	const limit = 200
 
-	pastRows, currentRows, upcomingRows, unlistedRows, err := d.collectAll(r.Context(), allow, hasWhitelist, now, limit, tab)
+	pastRows, currentRows, upcomingRows, unlistedRows, err := d.collectAll(r.Context(), allow, hasWhitelist, allCampaignsMode, now, limit, tab)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -524,7 +617,7 @@ func (d *dropsDeps) list(w http.ResponseWriter, r *http.Request) {
 		NullGameRows:  nullGameRows,
 		Accounts:      accountsForPick,
 		CSRFToken:     csrfToken(r),
-		NoWhitelist:   !hasWhitelist,
+		NoWhitelist:   !hasWhitelist && !allCampaignsMode,
 	}
 	switch tab {
 	case tabPast:
@@ -541,7 +634,7 @@ func (d *dropsDeps) list(w http.ResponseWriter, r *http.Request) {
 		for _, row := range currentRows {
 			mineable, chips := d.linkGrouping(r.Context(), &row, wl, plat)
 			row.ConnectChips = chips
-			if mineable || overrides[row.CampaignID] {
+			if allCampaignsMode || mineable || overrides[row.CampaignID] {
 				page.Rows = append(page.Rows, row)
 			} else {
 				page.UnlinkedRows = append(page.UnlinkedRows, row)
@@ -587,15 +680,14 @@ func (d *dropsDeps) list(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// collectAll runs all three queries (past, current, upcoming) and returns
-// rows filtered by the whitelist. PAST also unions in claim history so
-// that drops the operator has already claimed appear even if the campaign
-// row was evicted. The unlisted slice mirrors whichever tab the caller
-// asked for (`tab` arg) so Discoverable always matches the active tab —
-// not a confusing cross-tab union.
+// collectAll runs all three queries (past, current, upcoming) and applies
+// the whitelist in ordered mode. Ending-soonest mode returns every campaign
+// row. PAST also unions claim history so claimed drops remain visible even
+// if their campaign row was evicted. The unlisted slice mirrors the selected
+// tab so Discoverable never mixes rows from other tabs.
 func (d *dropsDeps) collectAll(
 	ctx context.Context,
-	allow map[string]struct{}, hasWhitelist bool,
+	allow map[string]struct{}, hasWhitelist, allCampaignsMode bool,
 	now int64, limit int64, tab dropTab,
 ) (past, current, upcoming, unlisted []dropsRow, err error) {
 	// Priority ranks so the whitelisted Current list mirrors the
@@ -611,7 +703,7 @@ func (d *dropsDeps) collectAll(
 	for _, c := range pastCamps {
 		row := dropsRow{
 			CampaignID:   c.ID,
-			When:         time.Unix(c.EndsAt, 0).In(d.loc.Location()).Format("2006-01-02 15:04 MST"),
+			When:         formatCampaignTime(c.EndsAt, d.loc),
 			Platform:     c.Platform,
 			Game:         c.Game,
 			CampaignName: c.Name,
@@ -619,7 +711,7 @@ func (d *dropsDeps) collectAll(
 			sortKey:      c.EndsAt,
 			Channels:     channelsFromRawJSON(c.RawJson),
 		}
-		if passesWhitelist(allow, hasWhitelist, c.Game) {
+		if allCampaignsMode || passesWhitelist(allow, hasWhitelist, c.Game) {
 			past = append(past, row)
 		} else {
 			unlistedPast = append(unlistedPast, row)
@@ -642,7 +734,7 @@ func (d *dropsDeps) collectAll(
 	for _, c := range currentCamps {
 		row := dropsRow{
 			CampaignID:   c.ID,
-			When:         time.Unix(c.EndsAt, 0).In(d.loc.Location()).Format("2006-01-02 15:04 MST"),
+			When:         formatCampaignTime(c.EndsAt, d.loc),
 			Platform:     c.Platform,
 			Game:         c.Game,
 			CampaignName: c.Name,
@@ -653,7 +745,7 @@ func (d *dropsDeps) collectAll(
 			LinkURL:      c.AccountLinkUrl,
 			Channels:     channelsFromRawJSON(c.RawJson),
 		}
-		if passesWhitelist(allow, hasWhitelist, c.Game) {
+		if allCampaignsMode || passesWhitelist(allow, hasWhitelist, c.Game) {
 			current = append(current, row)
 		} else {
 			unlistedCurrent = append(unlistedCurrent, row)
@@ -671,7 +763,7 @@ func (d *dropsDeps) collectAll(
 	for _, c := range upcomingCamps {
 		row := dropsRow{
 			CampaignID:   c.ID,
-			When:         time.Unix(c.StartsAt, 0).In(d.loc.Location()).Format("2006-01-02 15:04 MST"),
+			When:         formatCampaignTime(c.StartsAt, d.loc),
 			Platform:     c.Platform,
 			Game:         c.Game,
 			CampaignName: c.Name,
@@ -679,7 +771,7 @@ func (d *dropsDeps) collectAll(
 			sortKey:      c.StartsAt,
 			Channels:     channelsFromRawJSON(c.RawJson),
 		}
-		if passesWhitelist(allow, hasWhitelist, c.Game) {
+		if allCampaignsMode || passesWhitelist(allow, hasWhitelist, c.Game) {
 			upcoming = append(upcoming, row)
 		} else {
 			unlistedUpcoming = append(unlistedUpcoming, row)
@@ -709,7 +801,7 @@ func (d *dropsDeps) collectAll(
 		if row.Game == "" && row.CampaignName == "" {
 			continue
 		}
-		if !passesWhitelist(allow, hasWhitelist, row.Game) {
+		if !allCampaignsMode && !passesWhitelist(allow, hasWhitelist, row.Game) {
 			continue
 		}
 		if liveCampIDs[row.CampaignID] {
@@ -770,23 +862,26 @@ func (d *dropsDeps) collectAll(
 			return ai < aj
 		})
 	}
-	// The whitelisted Current list is ordered by whitelist PRIORITY
-	// (the order the watcher mines), ending-soonest as the tiebreak.
-	// Past/upcoming/unlisted stay ending-soonest.
-	sort.SliceStable(current, func(i, j int) bool {
-		ri, rj := current[i].rankKey, current[j].rankKey
-		if ri != rj {
-			return ri < rj
-		}
-		ai, aj := current[i].sortKey, current[j].sortKey
-		if ai == 0 {
-			return false
-		}
-		if aj == 0 {
-			return true
-		}
-		return ai < aj
-	})
+	if allCampaignsMode {
+		sortBySoonest(current)
+	} else {
+		// Ordered mode mirrors the watcher: game priority first, then the
+		// nearest known deadline.
+		sort.SliceStable(current, func(i, j int) bool {
+			ri, rj := current[i].rankKey, current[j].rankKey
+			if ri != rj {
+				return ri < rj
+			}
+			ai, aj := current[i].sortKey, current[j].sortKey
+			if ai == 0 {
+				return false
+			}
+			if aj == 0 {
+				return true
+			}
+			return ai < aj
+		})
+	}
 	// Past campaigns already ended, so "ending soonest" reads backwards —
 	// show the most recently ended at the top, oldest at the bottom.
 	sort.SliceStable(past, func(i, j int) bool {
@@ -803,6 +898,17 @@ func (d *dropsDeps) collectAll(
 	sortBySoonest(unlisted)
 
 	return past, current, upcoming, unlisted, nil
+}
+
+func formatCampaignTime(unix int64, zone *timeutil.Zone) string {
+	if unix <= 0 {
+		return "—"
+	}
+	location := time.UTC
+	if zone != nil {
+		location = zone.Location()
+	}
+	return time.Unix(unix, 0).In(location).Format("2006-01-02 15:04 MST")
 }
 
 // items returns the benefits + summary for a single campaign, rendered

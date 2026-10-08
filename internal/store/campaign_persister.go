@@ -36,10 +36,10 @@ const SkipOverridePrefix = "skip_override:"
 // into the local DB so the /drops page can render past + current +
 // upcoming tabs even before anything has been claimed.
 //
-// Non-whitelisted campaigns must NEVER reach this type — the watcher's
-// whitelist filter runs first. We do not re-apply the whitelist here so
-// the source of truth stays in one place (the account_games table, read
-// at watcher construction time).
+// Non-whitelisted Twitch campaigns may reach this type as catalog shells
+// with no benefits so the user can opt into their games. The watcher still
+// enforces its whitelist before mining; the persister does not decide
+// eligibility and does not re-apply the whitelist here.
 type CampaignPersister struct {
 	Q *gen.Queries
 }
@@ -52,7 +52,8 @@ func NewCampaignPersister(q *gen.Queries) *CampaignPersister {
 // PersistCampaigns upserts campaigns and their benefits. Status strings
 // are normalised: the upsert preserves whatever the backend returned
 // (e.g. "active", "expired", "upcoming"). starts_at/ends_at are stored
-// as Unix-epoch seconds, matching the campaigns table column type.
+// as Unix-epoch seconds. A zero value means the provider supplied no
+// parseable campaign time; discovered_at is never substituted.
 func (p *CampaignPersister) PersistCampaigns(ctx context.Context, camps []platform.Campaign) error {
 	if p == nil || p.Q == nil || len(camps) == 0 {
 		return nil
@@ -80,18 +81,8 @@ func (p *CampaignPersister) PersistCampaigns(ctx context.Context, camps []platfo
 		if status == "" {
 			status = "active"
 		}
-		// Default zero timestamps to plausible bounds so /drops's
-		// past/current/upcoming filter doesn't classify scraped
-		// campaigns as expired. Scrape supplies neither start nor
-		// end — best-effort: start=now, end=now+30d.
-		startsAt := c.StartsAt.Unix()
-		endsAt := c.EndsAt.Unix()
-		if c.StartsAt.IsZero() {
-			startsAt = now
-		}
-		if c.EndsAt.IsZero() {
-			endsAt = now + 30*24*3600
-		}
+		startsAt, startsAtSource := campaignTime(c.Platform, c.StartsAt)
+		endsAt, endsAtSource := campaignTime(c.Platform, c.EndsAt)
 		kind := c.Kind
 		if kind == "" {
 			kind = "drop"
@@ -123,9 +114,13 @@ func (p *CampaignPersister) PersistCampaigns(ctx context.Context, camps []platfo
 			ID:             c.ID,
 			Platform:       c.Platform,
 			Game:           c.Game,
+			TwitchGameID:   c.TwitchGameID,
+			TwitchGameSlug: c.TwitchGameSlug,
 			Name:           c.Name,
 			StartsAt:       startsAt,
 			EndsAt:         endsAt,
+			StartsAtSource: startsAtSource,
+			EndsAtSource:   endsAtSource,
 			Status:         status,
 			RawJson:        rawJSON,
 			DiscoveredAt:   now,
@@ -151,6 +146,14 @@ func (p *CampaignPersister) PersistCampaigns(ctx context.Context, camps []platfo
 		}
 	}
 	return nil
+}
+
+func campaignTime(platformName string, value time.Time) (int64, string) {
+	platformName = strings.ToLower(strings.TrimSpace(platformName))
+	if value.IsZero() || (platformName != "twitch" && platformName != "kick") {
+		return 0, "unknown"
+	}
+	return value.Unix(), platformName
 }
 
 // PersistAccountLinks records this account's per-campaign link state so the

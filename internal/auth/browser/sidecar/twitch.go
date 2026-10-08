@@ -441,7 +441,9 @@ func extractGqlCampaigns(body []byte) []apolloCampaign {
 					Name   string `json:"name"`
 					Status string `json:"status"`
 					Game   struct {
+						ID   string `json:"id"`
 						Name string `json:"displayName"`
+						Slug string `json:"slug"`
 					} `json:"game"`
 					EndAt   string `json:"endAt"`
 					StartAt string `json:"startAt"`
@@ -458,6 +460,8 @@ func extractGqlCampaigns(body []byte) []apolloCampaign {
 			ID:       c.ID,
 			Name:     cleanCampaignName(c.Name),
 			Game:     c.Game.Name,
+			GameID:   c.Game.ID,
+			GameSlug: c.Game.Slug,
 			EndsAt:   c.EndAt,
 			StartsAt: c.StartAt,
 			Kind:     "drop", // gql-side campaigns are real drops the user is enrolled in
@@ -471,7 +475,7 @@ func extractGqlCampaigns(body []byte) []apolloCampaign {
 // real Twitch campaign ID + accurate metadata. Scrape entries fill in
 // anything gql didn't return.
 func unionCampaigns(gql, scrape []apolloCampaign) []apolloCampaign {
-	seen := make(map[string]bool, len(gql)+len(scrape))
+	seen := make(map[string]int, len(gql)+len(scrape))
 	key := func(c apolloCampaign) string { return c.Game + "\x00" + c.Name }
 	out := make([]apolloCampaign, 0, len(gql)+len(scrape))
 	for _, c := range gql {
@@ -479,10 +483,10 @@ func unionCampaigns(gql, scrape []apolloCampaign) []apolloCampaign {
 			continue
 		}
 		k := key(c)
-		if seen[k] {
+		if _, ok := seen[k]; ok {
 			continue
 		}
-		seen[k] = true
+		seen[k] = len(out)
 		out = append(out, c)
 	}
 	for _, c := range scrape {
@@ -490,10 +494,25 @@ func unionCampaigns(gql, scrape []apolloCampaign) []apolloCampaign {
 			continue
 		}
 		k := key(c)
-		if seen[k] {
+		if i, ok := seen[k]; ok {
+			// Keep GraphQL's real campaign fields where present, while
+			// filling game metadata or raw bounds that GraphQL omitted from
+			// the page's cached Apollo representation.
+			if out[i].GameID == "" {
+				out[i].GameID = c.GameID
+			}
+			if out[i].GameSlug == "" {
+				out[i].GameSlug = c.GameSlug
+			}
+			if out[i].StartsAt == "" {
+				out[i].StartsAt = c.StartsAt
+			}
+			if out[i].EndsAt == "" {
+				out[i].EndsAt = c.EndsAt
+			}
 			continue
 		}
-		seen[k] = true
+		seen[k] = len(out)
 		out = append(out, c)
 	}
 	return out
@@ -549,6 +568,8 @@ type apolloCampaign struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
 	Game     string `json:"game"`
+	GameID   string `json:"gameId"`
+	GameSlug string `json:"gameSlug"`
 	EndsAt   string `json:"endsAt"`
 	StartsAt string `json:"startsAt"`
 	Kind     string `json:"kind"`
@@ -692,8 +713,8 @@ func scrapeDropsCampaignsPage(tabCtx context.Context) ([]apolloCampaign, error) 
 		};
 		const getGame = (v) => {
 			const g = resolve(v && v.game);
-			if (!g || typeof g !== 'object') return '';
-			return g.displayName || g.name || '';
+			if (!g || typeof g !== 'object') return {name: '', id: '', slug: ''};
+			return {name: g.displayName || g.name || '', id: g.id || '', slug: g.slug || ''};
 		};
 		const out = [];
 		const seen = new Set();
@@ -709,10 +730,13 @@ func scrapeDropsCampaignsPage(tabCtx context.Context) ([]apolloCampaign, error) 
 			const id = v.id || k.split(':').slice(1).join(':');
 			if (!id || seen.has(id)) continue;
 			seen.add(id);
+			const game = getGame(v);
 			out.push({
 				id: id,
 				name: v.name || v.title || '',
-				game: getGame(v),
+				game: game.name,
+				gameId: game.id,
+				gameSlug: game.slug,
 				endsAt: v.endAt || v.endsAt || v.endsAtTimestamp || '',
 				startsAt: v.startAt || v.startsAt || ''
 			});
@@ -840,7 +864,9 @@ func buildViewerDropsDashboardEnvelope(camps []apolloCampaign) []byte {
 			IsAccountConnected bool `json:"isAccountConnected"`
 		} `json:"self"`
 		Game struct {
+			ID   string `json:"id"`
 			Name string `json:"displayName"`
+			Slug string `json:"slug"`
 		} `json:"game"`
 		EndAt   string `json:"endAt"`
 		StartAt string `json:"startAt"`
@@ -854,6 +880,8 @@ func buildViewerDropsDashboardEnvelope(camps []apolloCampaign) []byte {
 		co.Status = "ACTIVE"
 		co.Self.IsAccountConnected = true // optimistic; watcher hits real check on claim
 		co.Game.Name = c.Game
+		co.Game.ID = c.GameID
+		co.Game.Slug = c.GameSlug
 		co.EndAt = c.EndsAt
 		co.StartAt = c.StartsAt
 		co.Kind = c.Kind

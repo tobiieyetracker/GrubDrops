@@ -10,7 +10,11 @@ import (
 )
 
 const getCampaign = `-- name: GetCampaign :one
-SELECT id, platform, game, name, starts_at, ends_at, status, raw_json, discovered_at, kind, account_linked, account_link_url FROM campaigns WHERE id = ?
+SELECT id, platform, game, name,
+    CASE WHEN starts_at_source IN ('twitch', 'kick') THEN starts_at ELSE 0 END AS starts_at,
+    CASE WHEN ends_at_source IN ('twitch', 'kick') THEN ends_at ELSE 0 END AS ends_at,
+    status, raw_json, discovered_at, kind, account_linked, account_link_url
+FROM campaigns WHERE id = ?
 `
 
 func (q *Queries) GetCampaign(ctx context.Context, id string) (Campaign, error) {
@@ -83,8 +87,14 @@ func (q *Queries) ListAccountLinksForCampaign(ctx context.Context, campaignID st
 }
 
 const listActiveCampaignsForPlatform = `-- name: ListActiveCampaignsForPlatform :many
-SELECT id, platform, game, name, starts_at, ends_at, status, raw_json, discovered_at, kind, account_linked, account_link_url FROM campaigns
-WHERE platform = ? AND status = 'active' AND starts_at <= ? AND ends_at >= ?
+SELECT id, platform, game, name,
+    CASE WHEN starts_at_source IN ('twitch', 'kick') THEN starts_at ELSE 0 END AS starts_at,
+    CASE WHEN ends_at_source IN ('twitch', 'kick') THEN ends_at ELSE 0 END AS ends_at,
+    status, raw_json, discovered_at, kind, account_linked, account_link_url
+FROM campaigns
+WHERE platform = ? AND status = 'active'
+  AND (starts_at_source NOT IN ('twitch', 'kick') OR starts_at <= ?)
+  AND (ends_at_source NOT IN ('twitch', 'kick') OR ends_at >= ?)
 ORDER BY discovered_at DESC
 `
 
@@ -209,9 +219,15 @@ func (q *Queries) ListClaimsForCampaign(ctx context.Context, campaignID string) 
 }
 
 const listCurrentCampaigns = `-- name: ListCurrentCampaigns :many
-SELECT id, platform, game, name, starts_at, ends_at, status, raw_json, discovered_at, kind, account_linked, account_link_url FROM campaigns
-WHERE starts_at <= ? AND ends_at > ?
-ORDER BY ends_at ASC
+SELECT id, platform, game, name,
+    CASE WHEN starts_at_source IN ('twitch', 'kick') THEN starts_at ELSE 0 END AS starts_at,
+    CASE WHEN ends_at_source IN ('twitch', 'kick') THEN ends_at ELSE 0 END AS ends_at,
+    status, raw_json, discovered_at, kind, account_linked, account_link_url
+FROM campaigns
+WHERE status = 'active'
+  AND (starts_at_source NOT IN ('twitch', 'kick') OR starts_at <= ?)
+  AND (ends_at_source NOT IN ('twitch', 'kick') OR ends_at > ?)
+ORDER BY CASE WHEN ends_at_source IN ('twitch', 'kick') THEN 0 ELSE 1 END, ends_at ASC
 LIMIT ?
 `
 
@@ -260,9 +276,13 @@ func (q *Queries) ListCurrentCampaigns(ctx context.Context, arg ListCurrentCampa
 }
 
 const listPastCampaigns = `-- name: ListPastCampaigns :many
-SELECT id, platform, game, name, starts_at, ends_at, status, raw_json, discovered_at, kind, account_linked, account_link_url FROM campaigns
-WHERE ends_at < ?
-ORDER BY ends_at DESC
+SELECT id, platform, game, name,
+    CASE WHEN starts_at_source IN ('twitch', 'kick') THEN starts_at ELSE 0 END AS starts_at,
+    CASE WHEN ends_at_source IN ('twitch', 'kick') THEN ends_at ELSE 0 END AS ends_at,
+    status, raw_json, discovered_at, kind, account_linked, account_link_url
+FROM campaigns
+WHERE status = 'expired' OR (ends_at_source IN ('twitch', 'kick') AND ends_at < ?)
+ORDER BY CASE WHEN ends_at_source IN ('twitch', 'kick') THEN ends_at ELSE discovered_at END DESC
 LIMIT ?
 `
 
@@ -309,9 +329,13 @@ func (q *Queries) ListPastCampaigns(ctx context.Context, arg ListPastCampaignsPa
 }
 
 const listUpcomingCampaigns = `-- name: ListUpcomingCampaigns :many
-SELECT id, platform, game, name, starts_at, ends_at, status, raw_json, discovered_at, kind, account_linked, account_link_url FROM campaigns
-WHERE starts_at > ?
-ORDER BY starts_at ASC
+SELECT id, platform, game, name,
+    CASE WHEN starts_at_source IN ('twitch', 'kick') THEN starts_at ELSE 0 END AS starts_at,
+    CASE WHEN ends_at_source IN ('twitch', 'kick') THEN ends_at ELSE 0 END AS ends_at,
+    status, raw_json, discovered_at, kind, account_linked, account_link_url
+FROM campaigns
+WHERE status = 'upcoming' OR (starts_at_source IN ('twitch', 'kick') AND starts_at > ?)
+ORDER BY CASE WHEN starts_at_source IN ('twitch', 'kick') THEN 0 ELSE 1 END, starts_at ASC
 LIMIT ?
 `
 
@@ -418,12 +442,32 @@ func (q *Queries) UpsertBenefit(ctx context.Context, arg UpsertBenefitParams) er
 }
 
 const upsertCampaign = `-- name: UpsertCampaign :exec
-INSERT INTO campaigns (id, platform, game, name, starts_at, ends_at, status, raw_json, discovered_at, kind, account_linked, account_link_url)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO campaigns (id, platform, game, name, starts_at, ends_at, status, raw_json, discovered_at, kind, account_linked, account_link_url, twitch_game_id, twitch_game_slug, starts_at_source, ends_at_source)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     name = excluded.name,
-    starts_at = excluded.starts_at,
-    ends_at = excluded.ends_at,
+    starts_at = CASE
+        WHEN excluded.starts_at_source IN ('twitch', 'kick') THEN excluded.starts_at
+        WHEN campaigns.starts_at_source IN ('twitch', 'kick') THEN campaigns.starts_at
+        ELSE 0
+    END,
+    ends_at = CASE
+        WHEN excluded.ends_at_source IN ('twitch', 'kick') THEN excluded.ends_at
+        WHEN campaigns.ends_at_source IN ('twitch', 'kick') THEN campaigns.ends_at
+        ELSE 0
+    END,
+    starts_at_source = CASE
+        WHEN excluded.starts_at_source IN ('twitch', 'kick') THEN excluded.starts_at_source
+        WHEN campaigns.starts_at_source IN ('twitch', 'kick') THEN campaigns.starts_at_source
+        ELSE 'unknown'
+    END,
+    ends_at_source = CASE
+        WHEN excluded.ends_at_source IN ('twitch', 'kick') THEN excluded.ends_at_source
+        WHEN campaigns.ends_at_source IN ('twitch', 'kick') THEN campaigns.ends_at_source
+        ELSE 'unknown'
+    END,
+    twitch_game_id = CASE WHEN excluded.twitch_game_id <> '' THEN excluded.twitch_game_id ELSE campaigns.twitch_game_id END,
+    twitch_game_slug = CASE WHEN excluded.twitch_game_slug <> '' THEN excluded.twitch_game_slug ELSE campaigns.twitch_game_slug END,
     status = excluded.status,
     raw_json = excluded.raw_json,
     kind = excluded.kind,
@@ -444,6 +488,10 @@ type UpsertCampaignParams struct {
 	Kind           string `json:"kind"`
 	AccountLinked  int64  `json:"account_linked"`
 	AccountLinkUrl string `json:"account_link_url"`
+	TwitchGameID   string `json:"twitch_game_id"`
+	TwitchGameSlug string `json:"twitch_game_slug"`
+	StartsAtSource string `json:"starts_at_source"`
+	EndsAtSource   string `json:"ends_at_source"`
 }
 
 func (q *Queries) UpsertCampaign(ctx context.Context, arg UpsertCampaignParams) error {
@@ -460,6 +508,10 @@ func (q *Queries) UpsertCampaign(ctx context.Context, arg UpsertCampaignParams) 
 		arg.Kind,
 		arg.AccountLinked,
 		arg.AccountLinkUrl,
+		arg.TwitchGameID,
+		arg.TwitchGameSlug,
+		arg.StartsAtSource,
+		arg.EndsAtSource,
 	)
 	return err
 }

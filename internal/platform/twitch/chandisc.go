@@ -37,7 +37,9 @@ type availableDropsFull struct {
 			StartAt string `json:"startAt"`
 			EndAt   string `json:"endAt"`
 			Game    struct {
+				ID   string `json:"id"`
 				Name string `json:"name"`
+				Slug string `json:"slug"`
 			} `json:"game"`
 			TimeBasedDrops []tvDrop `json:"timeBasedDrops"`
 		} `json:"viewerDropCampaigns"`
@@ -167,6 +169,7 @@ func (d *discovery) listByChannels(ctx context.Context, sess platform.Session, c
 				start, end := parseISO(vc.StartAt), parseISO(vc.EndAt)
 				add(platform.Campaign{
 					ID: vc.ID, Platform: "twitch", Game: vc.Game.Name, Name: vc.Name,
+					TwitchGameID: vc.Game.ID, TwitchGameSlug: vc.Game.Slug,
 					StartsAt: start, EndsAt: end, Status: windowStatus(start, end, now), Kind: "drop",
 					// Link state is unknowable without DropCampaignDetails;
 					// optimistic like scrape-sourced campaigns.
@@ -211,6 +214,18 @@ func (d *discovery) listByChannels(ctx context.Context, sess platform.Session, c
 			ex.AccountLinkChecked = true
 			ex.AccountLinkURL = ic.AccountLinkURL
 			ex.Status = status
+			if ex.StartsAt.IsZero() && !start.IsZero() {
+				ex.StartsAt = start
+			}
+			if ex.EndsAt.IsZero() && !end.IsZero() {
+				ex.EndsAt = end
+			}
+			if ex.TwitchGameID == "" {
+				ex.TwitchGameID = ic.Game.ID
+			}
+			if ex.TwitchGameSlug == "" {
+				ex.TwitchGameSlug = ic.Game.Slug
+			}
 			seen := make(map[string]struct{}, len(ex.Benefits))
 			for _, b := range ex.Benefits {
 				seen[b.ID] = struct{}{}
@@ -224,6 +239,7 @@ func (d *discovery) listByChannels(ctx context.Context, sess platform.Session, c
 		} else {
 			add(platform.Campaign{
 				ID: ic.ID, Platform: "twitch", Game: ic.Game.Name, Name: ic.Name,
+				TwitchGameID: ic.Game.ID, TwitchGameSlug: ic.Game.Slug,
 				StartsAt: start, EndsAt: end, Status: status, Kind: "drop",
 				AccountLinked: ic.Self.IsAccountConnected, AccountLinkChecked: true, AccountLinkURL: ic.AccountLinkURL,
 				Benefits: benefits,

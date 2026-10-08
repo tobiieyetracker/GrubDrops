@@ -1,8 +1,8 @@
 // Package discovery scrapes active drop campaigns from each platform
 // independently of the watcher loop. The goal is to keep the /drops page
-// (and the campaigns table that backs it) populated with every active
-// whitelisted campaign even when no account is signed in or no watcher
-// has ticked yet.
+// (and the campaigns table that backs it) populated with campaigns visible
+// to authenticated provider sessions, including safe Twitch catalog shells
+// before a game is opted into.
 //
 // A Scraper is a small orchestrator: on every tick it computes the union
 // of every enabled account's per-account game whitelist, asks each
@@ -21,7 +21,8 @@
 // Whitelist enforcement: providers MUST honor the game allow-list — the
 // Scraper materialises it as a GameFilter closure and either (a) sets it
 // on the platform.Session passed to the backend, or (b) filters
-// post-hoc. Non-whitelisted games NEVER reach the persister.
+// post-hoc. Twitch may persist non-whitelisted campaign shells, but must
+// not fetch their rewards; the watcher independently enforces mining access.
 package discovery
 
 import (
@@ -38,9 +39,8 @@ import (
 	"github.com/aalejandrofer/grubdrops/internal/store/gen"
 )
 
-// Provider scrapes active campaigns for a single platform. Implementations
-// must:
-//   - filter to games in `whitelist` (lowercased names + slugs)
+// Provider scrapes campaigns for a single platform. Implementations must:
+//   - fetch benefits only for games in `whitelist` (lowercased names + slugs)
 //   - return (nil, nil) when auth context is missing — never an error
 //   - tag each Campaign.Platform with the provider's platform name
 //
@@ -50,6 +50,14 @@ import (
 type Provider interface {
 	Name() string
 	Scrape(ctx context.Context, whitelist []string) ([]platform.Campaign, error)
+}
+
+// CatalogProvider may return safe campaign catalog rows when no game has
+// been opted into. Implementations must keep this path bounded and must not
+// fetch per-campaign reward details for unselected games. Providers without
+// this capability are skipped while the whitelist is empty.
+type CatalogProvider interface {
+	ScrapeCatalog(ctx context.Context) ([]platform.Campaign, error)
 }
 
 // CampaignPersister mirrors store.CampaignPersister — defined here as
@@ -91,10 +99,9 @@ func NewQueriesWhitelist(q *gen.Queries) WhitelistSource {
 		}
 		// Also union the GLOBAL priority list. Accounts that haven't picked
 		// a per-account whitelist mine from global_games (account_games is
-		// empty for them), so without this the discovery whitelist comes
-		// back empty and EVERY tick no-ops — campaigns never refresh and
-		// new ones never appear. The watcher applies the same global
-		// fallback per-account; discovery must mirror it.
+		// empty for them), so discovery needs the same fallback. When both
+		// lists are empty, Twitch may still populate catalog shells, but
+		// game-directory discovery and mining remain opt-in only.
 		gg, err := q.ListGlobalGames(ctx)
 		if err != nil {
 			return nil, err
@@ -182,16 +189,23 @@ func (s *Scraper) Tick(ctx context.Context) {
 		s.Logger.Warn("discovery: failed to load whitelist; skipping tick", "err", err)
 		return
 	}
-	if len(whitelist) == 0 {
-		// No account has opted into any game yet. Per project_goal.md
-		// we NEVER scrape non-whitelisted games, so without a whitelist
-		// the only safe action is to no-op.
-		s.Logger.Debug("discovery: whitelist empty, skipping tick")
-		return
-	}
-
 	for _, p := range s.Providers {
-		camps, err := p.Scrape(ctx, whitelist)
+		var camps []platform.Campaign
+		var err error
+		if len(whitelist) == 0 {
+			catalog, ok := p.(CatalogProvider)
+			if !ok {
+				s.Logger.Debug("discovery: whitelist empty, provider has no catalog-only path",
+					"provider", p.Name())
+				continue
+			}
+			// Catalog-only discovery lets the user see campaign shells and
+			// opt into their games. It does not make those campaigns
+			// mineable: the watcher still enforces its game whitelist.
+			camps, err = catalog.ScrapeCatalog(ctx)
+		} else {
+			camps, err = p.Scrape(ctx, whitelist)
+		}
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return

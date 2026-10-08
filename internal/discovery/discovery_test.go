@@ -54,6 +54,17 @@ type fakeProvider struct {
 	scrapeFn func(ctx context.Context, whitelist []string) ([]platform.Campaign, error)
 }
 
+type fakeCatalogProvider struct {
+	*fakeProvider
+	catalogCalls atomic.Int32
+	catalogCamps []platform.Campaign
+}
+
+func (p *fakeCatalogProvider) ScrapeCatalog(context.Context) ([]platform.Campaign, error) {
+	p.catalogCalls.Add(1)
+	return p.catalogCamps, p.err
+}
+
 func (p *fakeProvider) Name() string { return p.name }
 
 func (p *fakeProvider) Scrape(ctx context.Context, whitelist []string) ([]platform.Campaign, error) {
@@ -70,18 +81,26 @@ func (p *fakeProvider) Scrape(ctx context.Context, whitelist []string) ([]platfo
 	return p.camps, nil
 }
 
-// Tick honors the whitelist source: empty whitelist must short-circuit
-// without calling any provider (project_goal.md: never scrape
-// non-whitelisted games).
-func TestTick_EmptyWhitelistShortCircuits(t *testing.T) {
-	p := &fakeProvider{name: "fake"}
+// An empty whitelist permits bounded catalog-shell discovery from providers
+// that explicitly support it, while ordinary providers such as Kick remain
+// untouched.
+func TestTick_EmptyWhitelistUsesCatalogProvidersOnly(t *testing.T) {
+	catalog := &fakeCatalogProvider{
+		fakeProvider: &fakeProvider{name: "twitch"},
+		catalogCamps: []platform.Campaign{{ID: "c1", Platform: "twitch", Game: "Rust", Name: "Rust Drops"}},
+	}
+	ordinary := &fakeProvider{name: "kick", camps: []platform.Campaign{{ID: "k1"}}}
 	per := &recordingPersister{}
-	s := New(per, func(ctx context.Context) ([]string, error) { return nil, nil }, p)
+	s := New(per, func(ctx context.Context) ([]string, error) { return nil, nil }, catalog, ordinary)
 
 	s.Tick(context.Background())
 
-	assert.Equal(t, int32(0), p.calls.Load(), "provider must not be called when whitelist is empty")
-	assert.Empty(t, per.all(), "persister must not be called when whitelist is empty")
+	assert.Equal(t, int32(0), catalog.calls.Load(), "catalog path should replace ordinary scrape")
+	assert.Equal(t, int32(1), catalog.catalogCalls.Load())
+	assert.Equal(t, int32(0), ordinary.calls.Load(), "providers without catalog-only support must be skipped")
+	batches := per.all()
+	require.Len(t, batches, 1)
+	assert.Equal(t, catalog.catalogCamps, batches[0])
 }
 
 // Tick forwards the whitelist to every provider and persists what they
@@ -167,8 +186,8 @@ func TestRun_FiresImmediately(t *testing.T) {
 	assert.NotEmpty(t, per.all())
 }
 
-// buildAllowList rejects everything when given an empty slice — the
-// safe default for "no opt-ins configured".
+// buildAllowList rejects every game's detail fetch when given an empty
+// slice — the safe default for catalog-only discovery with no opt-ins.
 func TestBuildAllowList_EmptyRejects(t *testing.T) {
 	allow := buildAllowList(nil)
 	assert.False(t, allow("Rust"))

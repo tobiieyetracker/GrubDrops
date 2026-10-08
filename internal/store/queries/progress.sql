@@ -16,8 +16,8 @@ JOIN campaigns c ON c.id = b.campaign_id
 WHERE p.account_id = ?
   AND p.claimed_at IS NULL
   AND c.status = 'active'
-  AND c.starts_at <= ?
-  AND c.ends_at >= ?;
+  AND (c.starts_at_source NOT IN ('twitch', 'kick') OR c.starts_at <= ?)
+  AND (c.ends_at_source NOT IN ('twitch', 'kick') OR c.ends_at >= ?);
 
 -- name: InsertClaim :exec
 INSERT INTO claims (id, account_id, benefit_id, claimed_at, value_meta_json)
@@ -45,14 +45,14 @@ SELECT COUNT(*) FROM claims WHERE account_id = ? AND benefit_id = ?;
 
 -- name: CountClaimedForCampaign :one
 -- Distinct benefits already claimed by any account in this campaign.
--- The dashboard divides this by len(Benefits) to render the
+-- The dashboard divides this by the benefit count to render the
 -- "Claimed X / Y" badge on each Active Campaigns row.
 SELECT COUNT(DISTINCT c.benefit_id) FROM claims c
 JOIN benefits b ON b.id = c.benefit_id
 WHERE b.campaign_id = ?;
 
 -- name: CountClaims :one
--- Lifetime total drops claimed (every row in the claims table).
+-- Lifetime total drops claimed across all rows in the claims table.
 SELECT COUNT(*) FROM claims;
 
 -- name: CountClaimsSince :one
@@ -61,5 +61,5 @@ SELECT COUNT(*) FROM claims WHERE claimed_at >= ?;
 
 -- name: SumWatchMinutes :one
 -- Lifetime watch minutes: sum of per-benefit progress. Persistent, so it
--- survives restarts (unlike the heartbeat log ring used for today's count).
+-- survives restarts; today's count comes from the in-memory heartbeat log ring.
 SELECT CAST(COALESCE(SUM(minutes_watched), 0) AS INTEGER) FROM progress;

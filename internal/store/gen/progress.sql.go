@@ -171,8 +171,8 @@ JOIN campaigns c ON c.id = b.campaign_id
 WHERE p.account_id = ?
   AND p.claimed_at IS NULL
   AND c.status = 'active'
-  AND c.starts_at <= ?
-  AND c.ends_at >= ?
+  AND (c.starts_at_source NOT IN ('twitch', 'kick') OR c.starts_at <= ?)
+  AND (c.ends_at_source NOT IN ('twitch', 'kick') OR c.ends_at >= ?)
 `
 
 type ListUnclaimedProgressForAccountParams struct {

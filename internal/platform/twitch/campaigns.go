@@ -69,6 +69,7 @@ type campaignsData struct {
 			Game struct {
 				ID          string `json:"id"`
 				DisplayName string `json:"displayName"`
+				Slug        string `json:"slug"`
 			} `json:"game"`
 		} `json:"dropCampaigns"`
 	} `json:"currentUser"`
@@ -164,6 +165,8 @@ type inventoryData struct {
 					IsAccountConnected bool `json:"isAccountConnected"`
 				} `json:"self"`
 				Game struct {
+					ID   string `json:"id"`
+					Slug string `json:"slug"`
 					Name string `json:"name"`
 				} `json:"game"`
 				Allow struct {
@@ -202,8 +205,9 @@ type inventoryData struct {
 // benefit lists so the /drops page can show past + upcoming tabs filtered
 // by the whitelist). The Status field is lower-cased — "active", "expired",
 // or "upcoming" — matching the values persisted in the campaigns table.
-// The whitelist is ALWAYS applied: non-whitelisted campaigns are dropped
-// regardless of status.
+// GameFilter gates the per-campaign benefit-detail request: campaigns outside
+// the whitelist remain as shell rows with no benefits so /drops can show
+// catalog candidates, but the watcher cannot mine them until opted in.
 //
 // As a side effect listActive calls captureAllowed for ACTIVE campaigns so
 // that the caller (Backend) can drain the allow-lists via drainAllowed()
@@ -259,6 +263,8 @@ func (d *discovery) listActive(ctx context.Context, sess platform.Session) ([]pl
 			ID:                 c.ID,
 			Platform:           "twitch",
 			Game:               c.Game.DisplayName,
+			TwitchGameID:       c.Game.ID,
+			TwitchGameSlug:     c.Game.Slug,
 			Name:               c.Name,
 			StartsAt:           parseISO(c.StartAtRaw),
 			EndsAt:             parseISO(c.EndAtRaw),

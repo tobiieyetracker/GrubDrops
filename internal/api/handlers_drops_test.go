@@ -21,11 +21,9 @@ func renderDropsTable(t *testing.T, page dropsPage) string {
 	return buf.String()
 }
 
-// TestDropsTable_ColdStartCTA verifies the cold-start trap fix: when no
-// games are whitelisted at all (NoWhitelist), discovery never runs and the
-// page would otherwise be silently empty. We must show a bootstrap CTA that
-// links to where the user can add a game, instead of the misleading
-// "discovery populates this list" empty text.
+// TestDropsTable_ColdStartCTA verifies the empty-whitelist prompt remains
+// visible even when catalog-only discovery can show Twitch campaign shells:
+// users need to opt into a game before the watcher can mine it.
 func TestDropsTable_ColdStartCTA(t *testing.T) {
 	out := renderDropsTable(t, dropsPage{Tab: tabCurrent, NoWhitelist: true})
 	if !strings.Contains(strings.ToLower(out), "no games whitelisted") {

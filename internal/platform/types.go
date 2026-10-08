@@ -29,9 +29,10 @@ type Session struct {
 
 	// GameFilter, when non-nil, returns true iff the given game name (or
 	// slug) is on this account's whitelist. Backends consult it inside
-	// ListActiveCampaigns to short-circuit non-whitelisted games BEFORE
-	// fanning out to per-campaign detail fetches (saves bandwidth and
-	// makes the whitelist canonical, not just a watcher-side filter).
+	// ListActiveCampaigns to short-circuit non-whitelisted games before
+	// per-campaign detail fetches. A backend may still return a campaign
+	// shell for catalog display, but the watcher independently enforces
+	// the whitelist before mining.
 	// Match should be lenient — compare lowercased name OR slug.
 	GameFilter func(game string) bool `json:"-"`
 }
@@ -40,11 +41,15 @@ type Campaign struct {
 	ID       string
 	Platform string
 	Game     string
-	Name     string
-	StartsAt time.Time
-	EndsAt   time.Time
-	Status   string
-	Benefits []DropBenefit
+	// TwitchGameID is Twitch's numeric game/category ID. It is distinct from
+	// GrubDrops' internal games.id values such as "g_rust".
+	TwitchGameID   string
+	TwitchGameSlug string
+	Name           string
+	StartsAt       time.Time
+	EndsAt         time.Time
+	Status         string
+	Benefits       []DropBenefit
 
 	// AccountLinked indicates whether the user has connected the
 	// external game account this campaign requires for in-game

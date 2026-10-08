@@ -51,12 +51,12 @@ What you need depends on which platform you're mining:
 | | Twitch | Kick |
 |---|---|---|
 | **Login** | device-code (`twitch.tv/activate`) | `cookies.txt` export |
-| **How it watches** | direct HTTP — no browser | WebSocket; Chrome **sidecar** fallback (IVS playback) |
-| **Docker** | optional | **strongly recommended** — WS works without it, but the Chrome IVS fallback needs the docker socket |
+| **How it watches** | Authenticated browser sidecar in Docker Compose; direct HTTP fallback | WebSocket; Chrome **sidecar** fallback (IVS playback) |
+| **Docker** | recommended for full cross-game discovery; direct mode runs without it | **strongly recommended** — WS works without it, but the Chrome IVS fallback needs the docker socket |
 | **Run from source, no Docker** | ✅ a plain `go build` binary works | ⚠️ WS works; the Chrome fallback needs Docker |
 | **CPU arch** | any — `amd64` + `arm64` | `amd64` + `arm64` (arm64 is heavy — see note) |
 
-Twitch is direct HTTP — a plain Go binary mines it anywhere, no Docker. Kick mines browserless over WebSocket by default; the dependable Chrome IVS fallback runs as a sidecar over the docker socket, so **Docker is strongly recommended for Kick**.
+Docker Compose uses an authenticated browser sidecar for Twitch campaign discovery across games. A plain Go binary can still use direct HTTP discovery, which is limited to configured game directories for TV-client sessions. Kick mines browserless over WebSocket by default; the dependable Chrome IVS fallback runs as a sidecar over the docker socket, so **Docker is strongly recommended for Kick**.
 
 > **Raspberry Pi / ARM:** both images ship `arm64`; the sidecar uses Debian Chromium (keeps the H.264/AAC codecs for Kick's IVS stream). Heavy — ~4 GB RAM each.
 >
@@ -74,9 +74,10 @@ Twitch is direct HTTP — a plain Go binary mines it anywhere, no Docker. Kick m
 
 ### Run it
 
-Compose with the published image — just the **miner**. It auto-creates a Chrome
-**sidecar** per Kick account on demand over the mounted docker socket; you define
-no sidecar services.
+Compose with the published images starts the **miner** and one shared browser
+sidecar. Twitch uses that authenticated browser context to discover campaigns
+visible to each account across games. Kick watch-time still creates a separate
+Chrome sidecar per account on demand over the mounted Docker socket.
 
 ```yaml
 # compose.yml
@@ -84,15 +85,22 @@ services:
   miner:
     image: ghcr.io/aalejandrofer/grubdrops:latest
     restart: unless-stopped
+    depends_on: [browser]
     ports: ["8080:8080"]
     environment:
       GRUB_MASTER_KEY: "${GRUB_MASTER_KEY:?generate one with docker run --rm ghcr.io/aalejandrofer/grubdrops:latest keygen}"
       GRUB_DB_PATH: /data/miner.db
       GRUB_SECURE_COOKIES: "0"   # plain-HTTP localhost; set 1 behind HTTPS
       TZ: Europe/London           # server-side timezone
+      GRUB_BROWSER_URL: browser:9090
+      GRUB_TWITCH_BROWSER: "1"
     volumes:
       - ./data:/data
       - /var/run/docker.sock:/var/run/docker.sock # Kick only, if WS Breaks
+
+  browser:
+    image: ghcr.io/aalejandrofer/grubdrops-browser:latest
+    restart: unless-stopped
 
   # Optional auto-update: pulls a new image and recreates the miner only.
   # watchtower:
@@ -127,7 +135,8 @@ Open **http://localhost:8080** and create the admin login.
   `GRUB_MASTER_KEY` (value from `keygen` above) in the stack's **Environment
   variables** section before deploying. Use plain `docker compose`, not a Swarm
   stack, on a current Docker Engine.
-- **Twitch only?** Drop the docker-socket mount — no sidecars get created.
+- **Twitch only?** Drop the docker-socket mount; keep the shared `browser`
+  service for account-authenticated campaign discovery.
 - **Every knob?** Reference compose: [`deploy/docker-compose.yml`](deploy/docker-compose.yml).
 - **Build it?** `docker build -f deploy/Dockerfile.miner .`, or `go build ./cmd/miner`.
 
@@ -255,15 +264,24 @@ errors), re-export and paste again.
 
 ## Pick what to mine
 
-GrubDrops is whitelist-driven: it only discovers and mines games you opt into,
-so **a fresh install mines nothing until you whitelist at least one game**. Until
-then `/drops` shows a prompt pointing you here, and accounts sit in a *"no games
-yet"* state (not an error).
+In **ordered** mode, mining follows the game priority list. Catalog-capable
+Twitch sessions can show campaign shells on `/drops` before opt-in, so you can
+see a campaign's game and add it to the priority list. The miner fetches reward
+details and watches only selected games. In **ending soonest** mode, each
+account considers every active campaign its backend returns across all games,
+then picks the earliest known end time first. Campaigns with unknown end times
+sort last. Docker Compose routes Twitch through the authenticated browser
+backend, which discovers campaigns visible to the account across games. If you
+run the direct HTTP backend with a TV-client session, discovery remains limited
+to inventory campaigns and configured game directories.
 
 Add games either way — by name, no need to wait for a campaign to appear first:
 
 - **Global** (applies to every account): **Priority → add by name**.
 - **Per account** (overrides the global list): **Accounts → pick an account → add by name**.
+
+The priority list ranks **games**, not campaign IDs. Add the Twitch game/category
+name associated with a campaign; the campaign itself can be discovered afterward.
 
 Discovery starts crawling that game on the next tick and live campaigns show up
 on `/drops`.
@@ -284,9 +302,9 @@ are eligible, GrubDrops picks in this order:
 
 ```
 1. Campaign, by your priority mode (Settings):
-   ├─ ordered (default)  → your whitelist rank, top of the list first
-   ├─ ending_soonest     → soonest deadline first
-   └─ low_avbl_first     → fewest available channels first
+   ├─ ordered (default)  → selected game rank, top of the list first
+   └─ ending_soonest     → all active campaigns returned for the account,
+                           across games, with the soonest known deadline first
 2. Tiebreak: closest to a claim (fewest watch-minutes remaining)
 3. Restricted (team) campaigns ahead of open ones (both platforms)
 4. Channel: a live stream confirmed on the campaign's game,
@@ -311,7 +329,7 @@ default shown.
 | `GRUB_KICK_SIDECAR_NETWORK` | auto-detected | Override the self-detected sidecar network. |
 | `GRUB_KICK_SIDECAR_TEMPLATE` | `grubdrops-browser-{slug}` | Sidecar container-name template. |
 | `GRUB_KICK_SIDECAR_PORT` | `9090` | Sidecar gRPC port. |
-| `GRUB_BROWSER_URL` | none | Fixed sidecar address (legacy always-on). |
+| `GRUB_BROWSER_URL` | none | gRPC address for the shared browser sidecar; Docker Compose sets `browser:9090`. |
 | `GRUB_BROWSER_URLS` | none | Always-on sidecar pool, comma-separated. |
 | `GRUB_DISCOVERY_INTERVAL` | `60m` | Catalog-scrape cadence; also in Settings. |
 | `GRUB_AUTHCHECK_INTERVAL` | `1h` | Auth-health sweep cadence. |
@@ -319,7 +337,7 @@ default shown.
 | `GRUB_SECURE_COOKIES` | `0` | `1` marks cookies `Secure` (HTTPS only); keep `0` for plain HTTP — see note. |
 | `GRUB_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 | `GRUB_AUTHBYPASS` | `false` | **Disables all auth** when truthy (`1`/`true`). |
-| `GRUB_TWITCH_BROWSER` | `0` | `1` routes Twitch through the browser sidecar instead of direct HTTP. Experimental; the default direct-HTTP path is recommended. |
+| `GRUB_TWITCH_BROWSER` | `0` | `1` routes Twitch discovery through the authenticated browser sidecar. Docker Compose defaults this to `1` for cross-game campaign discovery; direct HTTP remains available with `0`. |
 | `GRUB_CANARY_INTERVAL` | Health-tab value | Overrides the accrual-canary run cadence (e.g. `6h`); falls back to the Settings ▸ Health value. |
 
 > **"Invalid CSRF token"?** `GRUB_SECURE_COOKIES` must match your scheme: `0`

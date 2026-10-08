@@ -50,12 +50,13 @@ Lo que necesites depende de qué plataforma estés minando:
 | | Twitch | Kick |
 |---|---|---|
 | **Inicio de sesión** | código de dispositivo (`twitch.tv/activate`) | exportación de `cookies.txt` |
-| **Cómo mira** | HTTP directo — sin navegador | **sidecar** de Chrome (reproducción IVS real) |
-| **Docker** | opcional | **obligatorio** — el minero genera el sidecar a través del socket de Docker |
-| **Ejecutar desde el código fuente, sin Docker** | ✅ basta un binario `go build` normal | ❌ necesita Docker para el sidecar |
+| **Discovery** | Docker Compose usa la página autenticada para descubrir campañas visibles en todos los juegos | canales descubiertos desde cada campaña |
+| **Cómo mira** | sidecar de navegador autenticado en Docker Compose; HTTP directo como alternativa | **sidecar** de Chrome (reproducción IVS real) |
+| **Docker** | recomendado para discovery completo; el modo directo funciona sin Docker | **obligatorio** — el minero genera el sidecar a través del socket de Docker |
+| **Ejecutar desde el código fuente, sin Docker** | ✅ binario `go build` con discovery directo limitado | ❌ necesita Docker para el sidecar |
 | **Arquitectura de CPU** | cualquiera — `amd64` + `arm64` | `amd64` + `arm64` (arm64 consume mucho — ver nota) |
 
-Twitch funciona sobre HTTP directo, así que un binario de Go normal lo mina en cualquier sitio —Raspberry Pi incluida, sin Docker. **El tiempo de visualización de Kick necesita un reproductor real**, así que el minero ejecuta un sidecar de Chrome/Chromium a través del socket de Docker, lo que hace que **Docker sea obligatorio para Kick**.
+Docker Compose ejecuta un sidecar autenticado para descubrir las campañas visibles de cada cuenta de Twitch en todos los juegos. Un binario Go normal puede usar el modo HTTP directo, pero las sesiones TV-client solo descubren campañas del Inventory y de los directorios de juegos configurados. **El tiempo de visualización de Kick necesita un reproductor real**, así que el minero ejecuta un sidecar de Chrome/Chromium a través del socket de Docker, lo que hace que **Docker sea obligatorio para Kick**.
 
 > **Raspberry Pi / ARM:** ambas imágenes se publican para `arm64`; en arm64 el sidecar usa Chromium de Debian (conserva los códecs H.264/AAC que decodifican el stream IVS de Kick). Funciona, pero es pesado —~4 GB de RAM por sidecar, así que una Pi con poca RAM solo gestiona un par de cuentas de Kick.
 >
@@ -73,10 +74,10 @@ Twitch funciona sobre HTTP directo, así que un binario de Go normal lo mina en 
 
 ### Ejecutarlo
 
-Docker Compose con las imágenes publicadas es la vía más rápida —solo el
-**miner**. Para el tiempo de visualización de Kick, crea automáticamente bajo demanda un
-**sidecar** de Chrome con códecs habilitados por cada cuenta (a través del socket de Docker montado), de modo que
-no defines tú ningún servicio de sidecar. (¿Solo Twitch? Ver más abajo.)
+Docker Compose con las imágenes publicadas es la vía más rápida. Ejecuta **miner** y un
+sidecar de navegador compartido para descubrir campañas visibles de Twitch en todos los
+juegos. Para Kick, el minero sigue creando bajo demanda un **sidecar** de Chrome con códecs
+habilitados por cada cuenta (a través del socket de Docker montado).
 
 ```yaml
 # compose.yml
@@ -84,17 +85,24 @@ services:
   miner:
     image: ghcr.io/aalejandrofer/grubdrops:latest
     restart: unless-stopped
+    depends_on: [browser]
     ports: ["8080:8080"]
     environment:
       GRUB_MASTER_KEY: "${GRUB_MASTER_KEY:?generate one with docker run --rm ghcr.io/aalejandrofer/grubdrops:latest keygen}"
       GRUB_DB_PATH: /data/miner.db
       GRUB_SECURE_COOKIES: "0"   # plain-HTTP localhost; set 1 behind HTTPS
+      GRUB_BROWSER_URL: browser:9090
+      GRUB_TWITCH_BROWSER: "1"
     volumes:
       # The container runs as nonroot (UID 65532); make ./data writable by it
       # first (see below) or use a named volume instead of a bind mount.
       - ./data:/data
       # lets the miner create/start/stop per-account browser sidecars on demand
       - /var/run/docker.sock:/var/run/docker.sock
+
+  browser:
+    image: ghcr.io/aalejandrofer/grubdrops-browser:latest
+    restart: unless-stopped
 ```
 
 La `GRUB_MASTER_KEY` debe ser una **identidad X25519 de age** (`AGE-SECRET-KEY-1…`): cifra los
@@ -132,9 +140,8 @@ Abre **http://localhost:8080**. La primera visita te pide crear un inicio de ses
   sección **Environment variables** del stack antes de desplegar. Usa `docker compose` normal,
   no un stack de Swarm, sobre una versión actual de Docker Engine.
 
-**¿Solo Twitch?** Quita el montaje del socket de Docker y deja `GRUB_BROWSER_URL`
-sin definir —nunca se crea ningún sidecar de Kick (Kick simplemente no tiene ninguna vía de acumulación de tiempo
-de visualización sin uno).
+**¿Solo Twitch?** Quita el montaje del socket de Docker; conserva el servicio `browser`
+y `GRUB_BROWSER_URL=browser:9090` para mantener el discovery entre juegos.
 
 **¿Quieres cada ajuste?** El compose de referencia completo (perfiles del sidecar, OIDC, cada
 ajuste comentado) está en
@@ -230,7 +237,7 @@ valor por defecto mostrado.
 | `GRUB_KICK_SIDECAR_NETWORK` | autodetectada | Red de Docker a la que conectar los sidecars. Por defecto, la propia red del minero (autodetectada); defínela para anularla. |
 | `GRUB_KICK_SIDECAR_TEMPLATE` | `grubdrops-browser-{slug}` | Plantilla del nombre de contenedor del sidecar por cuenta. |
 | `GRUB_KICK_SIDECAR_PORT` | `9090` | Puerto gRPC del sidecar. |
-| `GRUB_BROWSER_URL` | ninguna | Dirección fija del sidecar (modo heredado siempre activo). |
+| `GRUB_BROWSER_URL` | ninguna | Dirección gRPC del sidecar de navegador compartido; Docker Compose usa `browser:9090`. |
 | `GRUB_BROWSER_URLS` | ninguna | Conjunto de sidecars siempre activos separados por comas (un Chrome por cuenta de Kick). |
 | `GRUB_DISCOVERY_INTERVAL` | `60m` | Cadencia de barrido del catálogo (p. ej. `30m`, `2h`); también editable en Settings. |
 | `GRUB_AUTHCHECK_INTERVAL` | `12h` | Cadencia del barrido de salud de autenticación. |
@@ -238,7 +245,7 @@ valor por defecto mostrado.
 | `GRUB_SECURE_COOKIES` | `0` | Cookies de sesión seguras + esquema CSRF de mismo origen. Déjala en `0` para HTTP plano (`http://pi:8080`); ponla en `1` solo cuando se acceda por HTTPS (directamente o detrás de un proxy que termina TLS y que establece `X-Forwarded-Proto: https`). Ver nota más abajo. |
 | `GRUB_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 | `GRUB_AUTHBYPASS` | `false` | **Desactiva toda la autenticación** cuando es verdadero (`1`/`true`). |
-| `GRUB_TWITCH_BROWSER` | `0` | `1` enruta Twitch por el sidecar de navegador en lugar de HTTP directo. Experimental; se recomienda la ruta HTTP directa por defecto. |
+| `GRUB_TWITCH_BROWSER` | `0` | `1` usa el sidecar autenticado para descubrir campañas de Twitch. Docker Compose lo activa por defecto para cubrir todos los juegos; `0` vuelve al discovery directo limitado. |
 | `GRUB_CANARY_INTERVAL` | valor de Estado | Sustituye la cadencia del canario de acumulación (p. ej. `6h`); usa el valor de Ajustes ▸ Estado si no se define. |
 
 > **Autoalojamiento / "invalid CSRF token":** `GRUB_SECURE_COOKIES` debe coincidir con cómo

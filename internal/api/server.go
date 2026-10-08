@@ -346,7 +346,7 @@ func NewRouter(d Deps) http.Handler {
 		version:     d.Version,
 		oidc:        d.OIDC,
 	}
-	dropsH := &dropsDeps{q: d.Q, t: d.Templates, reload: d.Reload, sessions: d.Sessions, registry: d.Registry, loc: d.Zone, sm: d.Session}
+	dropsH := &dropsDeps{db: d.DB, q: d.Q, settings: d.SettingsStore, t: d.Templates, reload: d.Reload, sessions: d.Sessions, registry: d.Registry, loc: d.Zone, sm: d.Session}
 	historyH := &historyDeps{q: d.Q, ring: d.LogRing, t: d.Templates, loc: d.Zone}
 
 	authed.Get("/settings", settingsH.get)
@@ -372,6 +372,7 @@ func NewRouter(d Deps) http.Handler {
 	authed.Post("/settings/proxy", settingsH.postProxy)
 	authed.Post("/settings/proxy/test", settingsH.proxyTest)
 	authed.Get("/drops", dropsH.list)
+	authed.Get("/drops/campaigns.csv", dropsH.exportCSV)
 	authed.Get("/drops/campaigns/{id}/items", dropsH.items)
 	authed.Post("/drops/whitelist/add", dropsH.addWhitelist)
 	authed.Post("/drops/whitelist/channel", dropsH.addChannelWhitelist)
